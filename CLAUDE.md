@@ -3,7 +3,11 @@
 **Status:** Greenfield — design phase
 **Goal:** A self-contained Python service that computes a *richer* gamma analysis than any public vendor exposes, designed specifically to feed into AJ's existing futures scalping infrastructure (ConfluenceAlertSystem, RegimeClassifierV1, LevelTracker) on MES.
 
-**This is NOT a GEXBot reimplementation.** GEXBot's output format was a UI choice for a general-audience tool. We're building for a specific trading edge with specific integration points, and we have the freedom to design the data contract from first principles.
+**What this replaces.** Today AJ's gamma signals come from an external scanner (GEXBot or equivalent) pasted manually into the **OutsideRedge "GEX Levels" indicator** — a third-party, closed-source TradingView (Pine) indicator that is purely a visualization layer. This project replaces *both* layers: a Python service that computes the gamma analysis from raw chains, and (Phase 6) a new in-house NT8 indicator that consumes its JSON directly so the GEX data finally lives in the same trading platform as `ConfluenceAlertSystem`, `RegimeClassifierV1`, and `LevelTracker`. The OutsideRedge indicator is preserved during Phases 5–6 as a paste-pack compatibility surface only, so AJ never loses visualization while the new stack ships.
+
+**What we're not doing.** We're not trying to match GEXBot's numbers strike-for-strike. Sign convention, expiry weighting, and methodology choices are ours to make based on what improves the trading edge — see "Validation methodology" for why vendor parity is not the goal.
+
+**Note on the current architecture.** The v1 GEX visualization lives on TradingView; AJ's trading system lives on NT8. Today, GEX is therefore a discretionary input (eyeballed on TradingView, used to inform NT8 decisions) rather than a programmatic input to `ConfluenceAlertSystem`. Phase 6 closes that integration gap — that's where the largest stack-level edge improvement comes from, not from the gamma math itself.
 
 ---
 
@@ -34,7 +38,7 @@ If a phase doesn't move toward one of these, it's the wrong phase.
 | Implied moves | In the pack | **Removed as a first-class field** — see "Normalization basis" below; still emitted in paste-pack tokens 14–15 for v1 compat |
 | Output format | 16-token paste pack | Structured JSON (richer) + paste pack (v1 compat) |
 
-**The v1 paste pack output is preserved as a compatibility layer** so the existing `GexLevelsPastePack.cs` NT8 indicator keeps working unchanged. v2 consumers (a new richer NT8 indicator, ConfluenceAlertSystem, RegimeClassifierV1) read the structured JSON. v1 deprecates whenever AJ chooses to retire it.
+**The v1 paste pack output is preserved as a compatibility layer** so the existing OutsideRedge GEX Levels TradingView indicator keeps working unchanged. v2 consumers (a new NT8 indicator built in Phase 6, plus `ConfluenceAlertSystem` and `RegimeClassifierV1`) read the structured JSON directly. The OutsideRedge subscription can be cancelled once Phase 6 ships and AJ confirms the new indicator covers his visualization needs.
 
 ---
 
@@ -239,9 +243,9 @@ Full `GexAnalysis` object serialized as JSON. This is the source of truth for v2
 
 ### Compatibility output: `pack_YYYY-MM-DD.txt`
 
-The 16-token paste pack format, generated from the same underlying analysis. Lets the existing `GexLevelsPastePack.cs` indicator keep working without changes during the v2 transition.
+The 16-token paste pack format, generated from the same underlying analysis. Lets the existing OutsideRedge GEX Levels TradingView indicator keep working without changes during the v2 transition.
 
-The mapping from `GexAnalysis` → paste pack tokens is **finalized in Phase 5 against the actual `GexLevelsPastePack.cs:ParsePack` logic.** The provisional mapping below should be **verified against the C# parser before shipping**, because v1's L1–L4 / C1–C4 slot semantics (top-by-magnitude vs. nearest-by-distance vs. ordered-from-spot) are not yet confirmed from this repo:
+**Verification path.** The OutsideRedge indicator is closed-source Pine script; we cannot inspect its parser. The mapping from `GexAnalysis` → paste pack tokens must therefore be verified **empirically** against labeled screenshots AJ provides from the current scanner output (Phase 5). The provisional mapping below is a best guess from the reference packs in this doc; **do not ship without round-trip verification** because v1's L1–L4 / C1–C4 slot semantics (top-by-magnitude vs. nearest-by-distance vs. ordered-from-spot) cannot be confirmed from the indicator code:
 
 - Tokens 3, 4: `call_wall.peak.strike`, `put_wall.peak.strike`
 - Token 5: Vol Trigger — derived from vanna profile (the spot where vanna sign flips)
@@ -407,14 +411,15 @@ The phasing is structured so each phase produces a verifiable artifact and can s
 ### Phase 5: Multi-symbol output + paste-pack compat
 - Extend to NDX and RUT chains
 - Implement `output/paste_pack.py` to emit v1-compatible paste pack alongside JSON
-- **Confirm token mapping against `GexLevelsPastePack.cs:ParsePack`** before shipping; provisional mapping in "Output contracts" may need to change
+- **Confirm token mapping empirically against labeled screenshots from AJ's current scanner** before shipping; provisional mapping in "Output contracts" may need to change. The OutsideRedge indicator is closed Pine — no source available.
 - Wire daily orchestrator (`main.py`) to produce both files
-- **Verify:** paste pack round-trips through `GexLevelsPastePack.cs:ParsePack` cleanly
+- **Verify:** paste the v2-generated pack into the live OutsideRedge indicator and confirm each level renders at the expected strike with the expected label (Call Wall / Put Wall / L1–L4 / C1–C4 / ZG / VT). Repeat across at least 5 trading days with diverse profiles.
 
-### Phase 6: NT8 ingestion
-- New NT8 indicator (`GexAnalysisV2`) that consumes the JSON directly
-- Exposes the richer data via public API to `ConfluenceAlertSystem`
-- Run alongside `GexLevelsPastePack` (v1) until proven, then deprecate v1
+### Phase 6: NT8 ingestion (the integration phase)
+- New NT8 indicator (`GexAnalysisV2`) that consumes the JSON directly — same platform as `ConfluenceAlertSystem`, no manual paste step
+- Exposes the richer data via public API to `ConfluenceAlertSystem` and `RegimeClassifierV1`
+- Run alongside the OutsideRedge TradingView indicator until AJ trusts the new visualization, then cancel the OutsideRedge subscription
+- **This is where the largest stack-level edge improvement comes from.** Until Phase 6, GEX is still a discretionary input; only here does it become a programmatic confluence input.
 
 ### Phase 7+: Empirical methodology refinement
 - A/B sign convention, expiry weighting, peak threshold
@@ -483,7 +488,7 @@ Layer 3 needs historical chain data which may not be available cheaply. Possible
 
 ## Reference companion files
 
-- `GexLevelsPastePack.cs` (NinjaTrader project) — the v1 indicator. Defines the paste-pack format we maintain compatibility with. **Token slot semantics must be confirmed against this file before Phase 5 ships.**
+- **OutsideRedge "GEX Levels"** (TradingView, closed Pine — third-party paid indicator, not in our repo) — the v1 visualization. Defines the 16-token paste-pack format we maintain compatibility with. **Token slot semantics must be confirmed empirically (labeled screenshots from AJ's current scanner) before Phase 5 ships, since the source is not inspectable.** Public docs: https://outsideredge.com/docs/gamma-exposure-levels
 - `ConfluenceAlertSystem.cs` (NinjaTrader project) — the eventual consumer of v2 data. Look at its three-gate structure (Context → Location → Trigger) to understand how the GEX data should flow.
 - `RegimeClassifierV1.cs` (NinjaTrader project) — the regime classifier we'll stack with gamma regime to produce the 2x2 alignment signal.
 - `LevelTracker.cs` (NinjaTrader project) — the existing dynamic level tracker. v2 GEX levels complement these.
@@ -542,7 +547,7 @@ python-dotenv = "*"
 
 **End of Phase 4:** A daily JSON file is being produced with the full `GexAnalysis` object, including charm intensity and intraday wall test counts.
 
-**End of Phase 6:** ConfluenceAlertSystem is consuming the JSON in NT8 with a noticeable improvement in setup quality on at least one of: false-positive rate, win rate at quality-tier filters, or expectancy on bounce setups.
+**End of Phase 6:** ConfluenceAlertSystem is consuming the JSON in NT8 with a noticeable improvement in setup quality on at least one of: false-positive rate, win rate at quality-tier filters, or expectancy on bounce setups. The OutsideRedge TradingView indicator is no longer needed (subscription can be cancelled).
 
 **End of Phase 7:** The methodology has been calibrated against forward-traded data and the GEX inputs are demonstrably contributing to the trading edge — measured through actual PnL attribution, not vendor-parity metrics.
 
