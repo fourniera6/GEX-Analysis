@@ -1,6 +1,6 @@
 # GEX Analysis Service — Built for the Stack, Not Just to Replace GEXBot
 
-**Status:** Greenfield — design phase
+**Status:** Proof of concept: SPX + SPY key levels (call/put wall, peaks, zero gamma, regime) from CBOE's free delayed chain. Run with `python -m gex_analysis.main`.
 **Goal:** A self-contained Python service that computes a *richer* gamma analysis than any public vendor exposes, designed specifically to feed into AJ's existing futures scalping infrastructure (ConfluenceAlertSystem, RegimeClassifierV1, LevelTracker) on MES.
 
 **What this replaces.** Today AJ's gamma signals come from an external scanner (GEXBot or equivalent) pasted manually into the **OutsideRedge "GEX Levels" indicator** — a third-party, closed-source TradingView (Pine) indicator that is purely a visualization layer. This project replaces *both* layers: a Python service that computes the gamma analysis from raw chains, and (Phase 6) a new in-house NT8 indicator that consumes its JSON directly so the GEX data finally lives in the same trading platform as `ConfluenceAlertSystem`, `RegimeClassifierV1`, and `LevelTracker`. The OutsideRedge indicator is preserved during Phases 5–6 as a paste-pack compatibility surface only, so AJ never loses visualization while the new stack ships.
@@ -96,8 +96,8 @@ class GammaPeak:
     strike: float
     magnitude_signed: float          # raw GEX value
     magnitude_normalized: float      # 0.0..1.0 relative to max peak today
-    half_width_strikes: float        # strikes over which GEX stays above 50% of peak
-    distance_to_spot_pts: float      # signed
+    half_width_pts: float            # half the price span over which GEX stays above 50% of peak
+    distance_to_spot_pts: float      # strike - spot: positive = level above spot
     distance_to_spot_normalized: float  # signed, as fraction of expected_move_1d
     role: PeakRole                   # Support / Resistance / Broken (function of price location)
 
@@ -226,7 +226,7 @@ Full `GexAnalysis` object serialized as JSON. This is the source of truth for v2
     "peak": {
       "strike": 7330.0,
       "magnitude_normalized": 1.0,
-      "half_width_strikes": 8.0,
+      "half_width_pts": 8.0,
       "role": "Resistance"
     },
     "test_count_today": 0,
@@ -262,6 +262,28 @@ Phase 5+: replace the daily paste-pack workflow with NT8 reading the JSON direct
 
 ---
 
+## Data source
+
+**POC source: CBOE delayed quotes JSON**: `https://cdn.cboe.com/api/global/delayed_quotes/options/{_SPX|SPY|_NDX|QQQ|_RUT|IWM}.json` (indexes take a leading underscore, ETFs don't). It's free with no key or account, and implemented in `data_sources/cboe.py`.
+
+- **Fields per contract:** OCC symbol (root, expiry, C/P, strike), IV, open interest, volume, bid/ask, delta/gamma/vega/theta. SPX has about 29k contracts and SPY about 13k.
+- **Freshness:** 15-minute delayed. After the close, and on weekends, it serves the last session's values, which is the right snapshot for an end-of-day job.
+- **Caveats:** It's an unofficial, undocumented endpoint with no SLA; fine for personal use, but it could change or be blocked. It has no history (hence the raw-snapshot archive). CBOE's greeks are rounded to 4 decimals, so we compute gamma ourselves from IV. It has index options only (no ES/MES options), so MES levels = SPX levels + the ES–SPX basis.
+- **Upgrade paths**, if it breaks or we outgrow it: Schwab Developer API (free with an account), Tradier production ($10/mo), Marketdata.app Starter ($12/mo, 1-credit cached mode). Each is one new `DataSource` subclass.
+- **Ruled out:** Polygon free (no options), Tradier sandbox (no greeks), Marketdata.app free (per-contract credits can't cover a full chain), E*TRADE (daily interactive re-auth), Tickstream (options need a $29/mo plan; stream sampling rather than snapshots).
+
+### Index + ETF siblings (SPX + SPY)
+
+SPY options carry real positioning that SPX alone misses, and SPY traders watch SPY's own round strikes. Each run produces three views:
+
+1. `SPX`: standalone, at SPX strikes.
+2. `SPY`: standalone, at SPY strikes.
+3. `SPX_SPY`: SPY's per-strike GEX mapped onto the SPX scale (strike × `SPX_spot / SPY_spot`, binned to 5 points) and added to SPX. Dollar GEX per 1% is directly additive. Zero gamma for the combined view re-evaluates both chains at each hypothetical spot.
+
+Comparing view 3 against view 1 shows where ETF positioning actually moves a level.
+
+---
+
 ## Project structure
 
 ```
@@ -280,6 +302,7 @@ gex_analysis/
 │   ├── gradient.py              # d_GEX/d_K at spot (numerical or analytical)
 │   ├── regime.py                # GammaRegime classification + transition detection
 │   ├── expected_move.py         # ATM straddle 1D/1W moves (one source for JSON + paste pack)
+│   ├── combine.py               # map ETF (SPY) GEX onto the index (SPX) scale and sum
 │   └── time_of_day.py           # charm intensity, expiry weighting curve, close warnings
 ├── state/
 │   ├── __init__.py
@@ -331,12 +354,19 @@ State is persisted as one JSON file per trading-session date under `state/YYYY-M
 ```python
 @dataclass
 class GexConfig:
-    # Sign convention (verify empirically)
-    dealer_short_calls: bool = True
-    dealer_long_puts: bool = True
+    # Sign convention (verify empirically). Standard GEX convention: customers sell calls and buy
+    # puts, so dealers are long calls (+GEX) and short puts (-GEX). The original draft had these
+    # inverted, which would flip every sign and the regime definitions below.
+    dealer_long_calls: bool = True
+    dealer_short_puts: bool = True
+
+    # Pricing inputs
+    risk_free_rate: float = 0.04
+    dividend_yields: dict[str, float] = {"SPX": 0.0, "SPY": 0.012}
 
     # Expiry handling
-    expiry_window_dte: tuple[int, int] = (0, 30)
+    expiry_window_dte: tuple[int, int] = (0, 30)  # calendar-day DTE, inclusive
+    min_time_to_expiry_minutes: float = 15.0      # floor so 0DTE gamma doesn't explode near the close
     expiry_weighting: Literal['none', 'linear_decay', 'sqrt_decay'] = 'sqrt_decay'
 
     # Time-of-day adjustment
@@ -346,7 +376,7 @@ class GexConfig:
 
     # Peak detection
     peak_relative_threshold: float = 0.20  # peaks must be >= 20% of max magnitude
-    peak_min_separation_strikes: float = 5.0  # don't double-count adjacent strikes
+    peak_min_separation_pct: float = 0.0025  # of spot; works across SPX ($5 grid) and SPY ($1 grid)
 
     # Wall confidence
     wall_dominance_threshold: float = 1.5  # major wall must be >= 1.5x next runner-up
@@ -357,13 +387,19 @@ class GexConfig:
 
     # Zero gamma search
     zg_search_range_pct: float = 0.10
+    zg_grid_points: int = 161
     zg_hysteresis_pts: float = 5.0
     transition_lookback_runs: int = 5  # how recent a ZG cross is "Transitioning" (in service runs)
 
     # Regime
     regime_battleground_normalized: float = 0.5  # |dist/exp_move| within this = Battleground
     regime_high_confidence_normalized: float = 2.0  # beyond this = full confidence
+
+    # Index + ETF combined view
+    combined_strike_step: float = 5.0  # ETF strikes are mapped to the index scale and binned to this grid
 ```
+
+The POC implements the subset of these knobs it needs in `gex_analysis/config.py`.
 
 ---
 
@@ -371,12 +407,11 @@ class GexConfig:
 
 The phasing is structured so each phase produces a verifiable artifact and can ship independently. Don't move to N+1 until N is observable in production.
 
-### Phase 0: Scope confirmation
-- Document available APIs (Polygon? Broker? CBOE? ThetaData?)
-- Pull a recent SPX chain end-to-end with one provider
-- Verify: strike, expiry, type, OI, volume, IV per contract
-- Eyeball the data — confirm IV is per-strike (not just ATM), confirm OI is non-zero across strikes
-- **Stop here, write up what you've got, before any compute logic.**
+### Phase 0: Scope confirmation — ✅ done
+- Data source chosen: CBOE delayed quotes JSON (see "Data source"). SPX, SPY, NDX, RUT, QQQ and IWM verified.
+- Per contract: strike, expiry, type, OI, volume, IV, bid/ask, delta/gamma/vega/theta. IV is per strike; OI is populated across strikes.
+
+**POC status:** Phase 1 plus the Phase 2 slice (peaks, walls, zero gamma, basic regime) is implemented for SPX, SPY and a combined SPX+SPY view. Not yet: `gamma_gradient_at_spot`, `distance_dollars`, charm/vanna, intraday state, paste pack.
 
 ### Phase 1: Per-strike gamma profile (the foundation)
 - Implement BS gamma in `compute/greeks.py` (vectorized via py_vollib_vectorized)
@@ -452,7 +487,7 @@ If Layer 2 is wildly off (e.g., ZG is on the wrong side of spot, walls are at st
 - Compare: does v2 produce better setup quality scores? Better PnL? Better expectancy?
 - **This is the only validation that ultimately matters.** Phases 1–6 produce data; Phase 7+ proves the data is worth more than v1.
 
-Layer 3 needs historical chain data which may not be available cheaply. Possible workaround: run v2 forward in production for several months alongside v1, compare live performance.
+Layer 3 needs historical chain data. The CBOE feed has no history, so **every run archives the raw snapshot** to `data/raw/<SYM>_<session-date>.json.gz` (about 2.4 MB/day for SPX + SPY). Running daily from the POC onward builds our own history for free. Keep that folder backed up; it isn't in git.
 
 ---
 
@@ -462,7 +497,7 @@ Layer 3 needs historical chain data which may not be available cheaply. Possible
 - Implied moves as a **first-class field** of `GexAnalysis`. They're IV-derived display values, not gamma. The v1 paste-pack tokens 14–15 still carry them (because the format requires it), generated by `compute/expected_move.py` — which also produces `expected_move_1d` for normalization. One source of truth, used in two places.
 
 **Defer:**
-- NDX/RUT support until SPX/MES is solid (Phase 5)
+- NDX/RUT support until SPX/MES is solid (Phase 5). They follow the SPX + SPY pattern: NDX + QQQ and RUT + IWM, each with standalone levels plus a combined index+ETF view (all six are on the same free CBOE feed).
 - Intraday updates (more frequent than once-daily) until daily output is proven valuable
 - Custom analytics like "gamma momentum" (rate of change of gamma profile) until base profile is reliable
 - SQLite-backed state (current plan: JSON files per session date)
@@ -476,13 +511,13 @@ Layer 3 needs historical chain data which may not be available cheaply. Possible
 
 ## Open questions for AJ before Phase 0
 
-1. **Data source.** Which of these do you have working access to: Polygon Options Advanced, broker API (TD/Schwab/IBKR), CBOE DataShop, ThetaData, Tradier, others? IV-per-strike is the requirement; everything else is negotiable.
+1. ~~**Data source.**~~ **Answered:** CBOE's free delayed JSON for the POC. See "Data source".
 2. **Compute environment.** Local machine running daily? Cloud VM? Schedule via cron, Windows Task Scheduler, or run manually?
 3. **Output destination.** File on disk that NT8 reads? Push to a directory NT8 watches? HTTP endpoint? Daily email?
 4. **Existing TradingAgents tooling.** Does the TauricResearch repo have any options data adapters or chain handlers worth reusing?
 5. **Chain expiry universe.** When you've used GEX in trading, has it felt like 0DTE-driven dynamics matter most, or do longer-dated levels feel structural to you? This shapes the default `expiry_window_dte` config.
 6. **Backtest data.** Do you have historical option chain data (or budget for it) anywhere? This unlocks Layer 3 validation. If not, we'll plan around forward-only validation.
-7. **Latency budget.** Is this service permanently a once-daily batch job, or do you anticipate moving to intraday (every N minutes) by Phase 6+? This shapes the data-source decision **today**: a daily CBOE EOD pull is cheap and sufficient for batch, but Polygon WebSocket or broker streaming is needed for intraday. Picking the wrong source now means rewriting `data_sources/` later — far more expensive than picking right up front.
+7. ~~**Latency budget.**~~ **Answered:** daily/end-of-day for now, possibly forever. More frequent runs only if they prove their value. The CBOE feed refreshes every 15 minutes, so light intraday runs are possible without switching sources.
 
 ---
 
@@ -523,11 +558,8 @@ Save to `validation/reference_packs/`:
 numpy = "*"
 scipy = "*"                    # brentq for ZG root-find, savgol for profile smoothing
 pandas = "*"
-py-vollib-vectorized = "*"     # vectorized BS greeks + IV back-solving
-
-# Data sources (depends on chosen provider)
-# polygon-api-client = "*"
-# requests = "*"
+requests = "*"                 # CBOE delayed feed
+# py-vollib-vectorized — not needed: closed-form BS gamma in numpy covers the POC; revisit for charm/vanna
 
 # State persistence
 # Just stdlib (json) — no extras needed (SQLite deferred)
