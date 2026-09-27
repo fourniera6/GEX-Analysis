@@ -10,6 +10,7 @@ class Chain:
     underlying: str
     spot: float
     asof: datetime
+    root: np.ndarray
     expiry_date: np.ndarray  # datetime64[D]
     t_years: np.ndarray
     is_call: np.ndarray

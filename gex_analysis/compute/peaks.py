@@ -6,7 +6,7 @@ def find_peaks(strikes: np.ndarray, magnitude: np.ndarray, rel_threshold: float,
     top = magnitude.max(initial=0.0)
     if top <= 0:
         return []
-    candidates = np.flatnonzero(magnitude >= rel_threshold * top)
+    candidates = np.flatnonzero((magnitude >= rel_threshold * top) & (magnitude > 0))
     candidates = candidates[np.argsort(-magnitude[candidates], kind="stable")]
     kept: list[int] = []
     for i in candidates:

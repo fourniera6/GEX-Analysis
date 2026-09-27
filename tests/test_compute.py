@@ -92,3 +92,28 @@ def test_combine_profiles_maps_and_conserves():
     assert list(combined.strikes) == [7700.0, 7710.0, 7720.0]
     assert list(combined.call) == [1.0, 2.5, 0.25]
     assert combined.net.sum() == pytest.approx(spx.net.sum() + spy.net.sum())
+
+
+def test_build_analysis_net_walls_and_rank_sources():
+    from datetime import datetime
+
+    from gex_analysis.main import build_analysis
+
+    # 8000 carries huge offsetting call and put gamma (e.g. box trades): big on each side, small net.
+    profile = StrikeProfile(
+        strikes=np.array([7500.0, 7700.0, 7800.0, 8000.0]),
+        call=np.array([0.5, 7.0, 10.0, 13.0]),
+        put=np.array([-4.5, -8.0, -1.0, -11.0]),
+    )
+    a = build_analysis(
+        "SPX", 7743.0, datetime(2026, 9, 25, 16), profile,
+        structural_gex=lambda s: s - 7650.0, transition_gex=lambda s: s - 7710.0,
+        expected_move=43.5, cfg=GexConfig(peak_relative_threshold=0.0),
+    )
+    assert a.call_wall.peak.strike == 7800   # net +9
+    assert a.put_wall.peak.strike == 7500    # net -4
+    assert [p.strike for p in a.support_peaks] == [8000, 7700, 7500, 7800]    # |put| ranking
+    assert [p.strike for p in a.resistance_peaks] == [7800, 8000]             # positive net ranking
+    assert a.zero_gamma == pytest.approx(7650.0)
+    assert a.transition_level == pytest.approx(7710.0)
+    assert a.regime == "Positive"

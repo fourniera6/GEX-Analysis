@@ -28,12 +28,15 @@ def test_parse_payload_expiry_times_and_filtering():
         _option("SPX261016P07700000"),           # AM-settled monthly: settles 09:30
         _option("SPXW261231C07700000"),          # outside 30 DTE
         _option("SPXW260928P07600000", oi=0.0),  # no open interest
+        _option("SPXW261106C07700000"),          # crosses the 1 Nov DST change
     ]))
     assert chain.t_years[0] == pytest.approx(0.0)
     assert chain.t_years[1] * 365 == pytest.approx(3.0)
     assert chain.t_years[2] * 365 == pytest.approx(21 - 6.5 / 24)
+    assert chain.t_years[5] * 365 == pytest.approx(42 + 1 / 24)
+    assert list(chain.root[:3]) == ["SPXW", "SPXW", "SPX"]
 
-    contracts = ContractSet.from_chain(chain, GexConfig())
+    contracts = ContractSet.from_chain(chain, GexConfig(), (0, 30))
     assert list(contracts.strike) == [7700.0, 7700.0]
     assert list(contracts.is_call) == [True, False]
 

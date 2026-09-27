@@ -29,17 +29,18 @@ def parse_payload(underlying: str, raw: bytes) -> Chain:
     for o in data["options"]:
         root, expiry, is_call, strike = parse_occ(o["option"])
         settle = time(9, 30) if root in AM_SETTLED_ROOTS else time(16, 0)
-        t_years = (datetime.combine(expiry, settle, ET) - asof).total_seconds() / SECONDS_PER_YEAR
+        t_years = (datetime.combine(expiry, settle, ET).timestamp() - asof.timestamp()) / SECONDS_PER_YEAR
         rows.append((
-            expiry, t_years, is_call, strike,
+            root, expiry, t_years, is_call, strike,
             *(float(o.get(k) or 0.0) for k in ("iv", "open_interest", "volume", "bid", "ask")),
         ))
 
-    expiry, t_years, is_call, strike, iv, oi, volume, bid, ask = zip(*rows)
+    root, expiry, t_years, is_call, strike, iv, oi, volume, bid, ask = zip(*rows)
     return Chain(
         underlying=underlying,
         spot=float(data["current_price"]),
         asof=asof,
+        root=np.array(root),
         expiry_date=np.array(expiry, dtype="datetime64[D]"),
         t_years=np.array(t_years),
         is_call=np.array(is_call),

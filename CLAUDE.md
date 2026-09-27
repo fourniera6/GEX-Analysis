@@ -1,13 +1,19 @@
 # GEX Analysis Service — Built for the Stack, Not Just to Replace GEXBot
 
-**Status:** Proof of concept: SPX + SPY key levels (call/put wall, peaks, zero gamma, regime) from CBOE's free delayed chain. Run with `python -m gex_analysis.main`.
+**Status:** Working service. It computes GEX levels for SPX/SPY, NDX/QQQ and RUT/IWM from CBOE's free delayed chains and writes `gex_pack.txt` for the NT8 indicator, plus a richer JSON per symbol. Next: side-by-side validation against the vendor on live charts.
 **Goal:** A self-contained Python service that computes a *richer* gamma analysis than any public vendor exposes, designed specifically to feed into AJ's existing futures scalping infrastructure (ConfluenceAlertSystem, RegimeClassifierV1, LevelTracker) on MES.
 
-**What this replaces.** Today AJ's gamma signals come from an external scanner (GEXBot or equivalent) pasted manually into the **OutsideRedge "GEX Levels" indicator** — a third-party, closed-source TradingView (Pine) indicator that is purely a visualization layer. This project replaces *both* layers: a Python service that computes the gamma analysis from raw chains, and (Phase 6) a new in-house NT8 indicator that consumes its JSON directly so the GEX data finally lives in the same trading platform as `ConfluenceAlertSystem`, `RegimeClassifierV1`, and `LevelTracker`. The OutsideRedge indicator is preserved during Phases 5–6 as a paste-pack compatibility surface only, so AJ never loses visualization while the new stack ships.
+```
+python -m gex_analysis.main --pack-path "<Documents>\NinjaTrader 8\gex_pack_service.txt"
+python -m gex_analysis.compare <vendor gex_pack.txt> <our gex_pack.txt>
+pytest
+```
 
-**What we're not doing.** We're not trying to match GEXBot's numbers strike-for-strike. Sign convention, expiry weighting, and methodology choices are ours to make based on what improves the trading edge — see "Validation methodology" for why vendor parity is not the goal.
+**What this replaces.** Today AJ's levels come from a vendor scanner, pasted daily into `gex_pack.txt`. That file is read by AJ's own NT8 indicator, `GexLevelsPastePack.cs` (about 1,950 lines, in the NinjaTrader project), which renders the levels, overlays the ETF sibling's levels, shows prior-day ghosts and confluence tags, and exposes a public `CurrentGammaRegime` and proximity API. The indicator originally mirrored a closed TradingView indicator (OutsideRedge "GEX Levels"), which is how the vendor pack format came about. **This service replaces the vendor and the manual paste:** it writes a spec-compliant `gex_pack.txt`, so every NT8 chart works with no indicator changes. The richer JSON is the path for data the pack can't carry.
 
-**Note on the current architecture.** The v1 GEX visualization lives on TradingView; AJ's trading system lives on NT8. Today, GEX is therefore a discretionary input (eyeballed on TradingView, used to inform NT8 decisions) rather than a programmatic input to `ConfluenceAlertSystem`. Phase 6 closes that integration gap — that's where the largest stack-level edge improvement comes from, not from the gamma math itself.
+**The output contract is `docs/GEX-PACK-SPEC.md`**, extracted from the live indicator source. Where it and this doc overlap on the pack format, the spec wins.
+
+**What we match and what we don't.** We match the vendor's *semantics*: what a Call Wall, Put Wall, Transition Level or Dealer Pivot means, because AJ's trading reads the levels that way. The definitions below were chosen by comparing against the vendor's actual levels. We don't tune knobs to chase the vendor's exact numbers. Differences within a few points are expected and fine. Edge is decided by Layer 3 validation, not vendor parity.
 
 ---
 
@@ -15,78 +21,111 @@
 
 The four reasons to build, ordered by priority for AJ's edge:
 
-1. **Surface gamma information GEXBot can't.** Charm exposure, vanna with sign, gamma profile shape, gradient at spot, wall test degradation — these aren't on GEXBot's product roadmap and they're directly actionable for intraday scalping.
+1. **Surface gamma information the vendor can't.** Charm exposure, vanna with sign, gamma profile shape, gradient at spot, wall test degradation — these aren't in the vendor pack and they're directly actionable for intraday scalping.
 2. **Integrate natively with the existing stack.** ConfluenceAlertSystem wants a continuous score, not a discretized "Moderate" tag. RegimeClassifierV1 already does price-action regime classification — combining gamma regime with that gives a 2x2 alignment signal that no off-the-shelf tool produces.
-3. **Tune for futures and the trading windows that matter.** GEXBot computes for SPX cash with one daily snapshot. AJ trades MES at 9:30–11:00 AM and 15:00–16:00 ET. These are very different gamma environments and deserve different methodology.
-4. **Own the methodology.** Eventually intraday updates, custom analytics, and (if research warrants) replacing the daily paste pack workflow entirely with a richer NT8 ingestion path.
+3. **Tune for futures and the trading windows that matter.** AJ trades MES at 9:30–11:00 AM and 15:00–16:00 ET. These are very different gamma environments and deserve different methodology.
+4. **Own the methodology and remove the manual step.** No vendor dependency, no daily paste, no hand-typed refs (the 25 Sep file had `QQQ 7.45.4`, which silently broke the NQ ratio).
 
 If a phase doesn't move toward one of these, it's the wrong phase.
 
 ---
 
-## What we're keeping vs. replacing from the v1 (GEXBot-compatible) approach
+## What we're keeping vs. replacing
 
-| Aspect | v1 (already shipped) | v2 (this project) |
+| Aspect | Vendor pack (today) | This service |
 |---|---|---|
-| Level count | Fixed 13 (Call Wall, Put Wall, ZG, VT, L1-L4, C1-C4) | Variable, all peaks above relative threshold |
-| Magnitude | Discrete (Strongest / Moderate / Weakest) | Continuous (0.0–1.0 normalized score) |
-| Greeks | Gamma only | Gamma + Charm + Vanna |
-| Profile data | Peak prices only | Full profile + half-widths + gradient at spot |
-| Time-of-day | Single daily snapshot | Time-aware (charm intensity, expiry weighting curve) |
-| Wall tracking | None | Intraday test count per major wall |
-| Regime | Boolean (positive/negative gamma) | Continuous regime confidence + transition detection |
-| Implied moves | In the pack | **Removed as a first-class field** — see "Normalization basis" below; still emitted in paste-pack tokens 14–15 for v1 compat |
-| Output format | 16-token paste pack | Structured JSON (richer) + paste pack (v1 compat) |
+| Level count | Fixed 12 slots per symbol (CW, PW, TL, GD1–4, C1–4, DP) | Same 12 slots in the pack; variable peak lists in JSON |
+| Magnitude | Discrete rank (Strongest / Moderate / Weakest) | Rank in the pack; continuous 0.0–1.0 score in JSON |
+| Greeks | Gamma only | Gamma now; Charm + Vanna planned (Phase 3) |
+| Profile data | Peak prices only | Full profile + half-widths in JSON |
+| Time-of-day | Single daily snapshot | Daily now; time-aware planned (Phase 3–4) |
+| Wall tracking | None | Intraday test count planned (Phase 4) |
+| Regime | Pivot level only | Pivot in the pack; continuous regime confidence in JSON |
+| Futures levels | Index levels + one basis | Same, with the basis implied from index options |
+| Refs | Typed by hand at paste time | Written from the same snapshot, so each pair is simultaneous |
+| Output | Pasted `gex_pack.txt` | Generated `gex_pack.txt` (atomic, auto-rolled `[PRIOR]`) + JSON |
 
-**The v1 paste pack output is preserved as a compatibility layer** so the existing OutsideRedge GEX Levels TradingView indicator keeps working unchanged. v2 consumers (a new NT8 indicator built in Phase 6, plus `ConfluenceAlertSystem` and `RegimeClassifierV1`) read the structured JSON directly. The OutsideRedge subscription can be cancelled once Phase 6 ships and AJ confirms the new indicator covers his visualization needs.
+---
+
+## Level definitions
+
+Every structural level uses dealer dollar gamma per 1% move, per strike, with dealers long calls and short puts. Net = call side + put side.
+
+| Pack slot | Meaning | Our definition | Expiries |
+|---|---|---|---|
+| CW | Call Wall | Strike with the largest **positive net** GEX | 0–365 DTE |
+| PW | Put Wall | Strike with the largest **negative net** GEX | 0–365 DTE |
+| TL | Transition Level (vol trigger) | Shift-spot zero gamma | **0–7 DTE** |
+| GD1–4 | Support-side ranks | Top 4 strikes by **put-side** \|GEX\|, strongest first | 0–365 DTE |
+| C1–4 | Resistance-side ranks | Top 4 strikes by **positive net** GEX, strongest first | 0–365 DTE |
+| DP | Dealer Pivot (zero gamma) | Shift-spot zero gamma | 0–365 DTE |
+
+Ranks keep strikes at least 0.25% of spot apart, include levels on either side of spot (the indicator assigns Support/Resistance roles by price), and are padded with `0` when fewer than 4 qualify.
+
+**Evidence (one day, 25 Sep 2026).** CBOE snapshot compared with the vendor's 25 Sep pack. The OI in both is the 24 Sep end-of-day figure, so they line up.
+
+| Level | SPX vendor → ours | Across SPX, SPY, NDX, QQQ, IWM |
+|---|---|---|
+| CW / PW | 7800 / 7500 → **7800 / 7500** | 9 of 10 exact (SPY PW 750 vs 760) |
+| TL | 7710 → **7710.1** | SPY +2.0, QQQ +2.1, IWM −4.8; **NDX off by 2.5%** |
+| DP | 7659 → 7668.8 | SPY +4.5, QQQ +2.6, IWM +3.4, NDX −347 |
+| GD1–4 | 8000, 7700, 7000, 7800 → 8000, 7700, 7000, 7600 | about 13 of 20 levels found |
+| C1–4 | 7797, 7897, 7997, 7504 → 7800, 7900, 8000, 8100 | **unresolved:** at best 7 of 20 under any definition tried |
+
+- **Net walls** fix the "8000 is both walls" artifact. The 8000 strike carries huge, mostly offsetting call and put gamma (likely box or conversion trades).
+- **Rejected:** a cumulative-sum zero gamma (7850–7980 for SPX), side-of-spot walls (8000/7700), and a vanna sign flip for TL.
+- **Open questions:** the vendor's C levels are often not real strikes (NDX 30022, 30845), so they come from some other method. NDX and IWM pivots may need their own expiry windows.
+- Everything above is config (`structural_window_dte`, `transition_window_dte`, `support_rank_source`, `resistance_rank_source`). Revisit after 1–2 weeks of daily `compare` runs; don't retune on a single day.
 
 ---
 
 ## The richer data model
 
-The output object the service emits per run:
+The JSON emitted per symbol per run. Fields marked *(planned)* aren't implemented yet; `gex_analysis/output/analysis.py` is the implemented subset.
 
 ```python
 @dataclass
 class GexAnalysis:
     # Metadata
-    timestamp: datetime              # when this analysis was computed (America/New_York)
-    underlying: str                  # "SPX" — drives which futures map to it
-    spot: float                      # current cash spot price
+    timestamp: datetime              # snapshot time (America/New_York)
+    underlying: str                  # "SPX", "SPY", ..., or "SPX_SPY" for the combined view
+    spot: float
     expected_move_1d: float          # ATM-straddle-derived, used for normalizing distances
+    total_gex_per_pct: float         # dealer $ gamma per 1% move at spot, structural expiries
 
     # Continuous profiles (the source of truth — all other fields derive from these)
-    gamma_profile: dict[float, float]    # strike -> dealer GEX (signed, normalized to [-1, 1] by max abs)
-    charm_profile: dict[float, float]    # strike -> dealer charm exposure
-    vanna_profile: dict[float, float]    # strike -> dealer vanna exposure
+    gamma_profile: dict[float, float]    # strike -> net dealer GEX, normalized to [-1, 1] by max abs
+    charm_profile: dict[float, float]    # (planned) strike -> dealer charm exposure
+    vanna_profile: dict[float, float]    # (planned) strike -> dealer vanna exposure
 
     # Discrete derived levels (variable count, ranked by magnitude)
-    call_peaks: list[GammaPeak]      # peaks above relative threshold
-    put_peaks: list[GammaPeak]
+    support_peaks: list[GammaPeak]       # GD1-4 in the pack
+    resistance_peaks: list[GammaPeak]    # C1-4 in the pack
 
-    # Major walls (single highest-magnitude peak each side)
-    call_wall: WallInfo              # composition over GammaPeak; see below
-    put_wall: WallInfo
+    # Major walls
+    call_wall: WallInfo                  # CW: largest positive net GEX
+    put_wall: WallInfo                   # PW: largest negative net GEX
 
     # Regime
-    zero_gamma: float                # spot price where total GEX = 0 (see compute/zero_gamma.py)
-    distance_to_zg_pts: float        # signed: positive = spot above ZG
-    distance_to_zg_normalized: float # signed: distance as fraction of expected_move_1d
-    gamma_gradient_at_spot: float    # d_GEX/d_K evaluated at spot (per-point hedging pressure)
-    regime: GammaRegime              # Positive / Negative / Transitioning / Battleground
-    regime_confidence: float         # 0.0..1.0 — how decisively in regime
+    zero_gamma: float                    # DP: shift-spot zero gamma, structural expiries
+    transition_level: float              # TL: shift-spot zero gamma, short-dated expiries
+    distance_to_zg_pts: float            # spot - zero_gamma: positive = spot above DP
+    distance_to_zg_normalized: float     # as a multiple of expected_move_1d
+    gamma_gradient_at_spot: float        # (planned) d_GEX/d_K at spot (per-point hedging pressure)
+    regime: GammaRegime                  # Positive / Negative / Battleground (Transitioning planned)
+    regime_confidence: float             # 0.0..1.0 — how decisively in regime
 
-    # Time-of-day context
+    # Time-of-day context (planned)
     minutes_to_close: int
-    charm_intensity: float           # 0.0..1.0 — see compute/time_of_day.py for formula
-    near_close_warning: bool         # true in last 30 min when charm is meaningful
+    charm_intensity: float               # 0.0..1.0 — see compute/time_of_day.py formula below
+    near_close_warning: bool             # true in last 30 min when charm is meaningful
 
-    # Cross-cut analyses
+    # Cross-cut analyses (planned)
     oi_gex_profile: dict[float, float]      # OI-based gamma (structural)
     volume_gex_profile: dict[float, float]  # Today's volume-based gamma (what's moving now)
     new_positioning: list[float]            # strikes where volume GEX deviates from OI GEX
 
-    # State (carried across runs)
+    # State (planned, carried across runs)
     walls_tested_today: dict[float, int]    # strike -> test count for today's session
 ```
 
@@ -94,34 +133,32 @@ class GexAnalysis:
 @dataclass
 class GammaPeak:
     strike: float
-    magnitude_signed: float          # raw GEX value
-    magnitude_normalized: float      # 0.0..1.0 relative to max peak today
-    half_width_pts: float            # half the price span over which GEX stays above 50% of peak
+    magnitude_signed: float          # $ gamma per 1% move from the ranking series
+    magnitude_normalized: float      # 0.0..1.0 relative to the strongest peak in the same ranking
+    half_width_pts: float            # half the price span over which the ranking stays above 50% of peak
     distance_to_spot_pts: float      # strike - spot: positive = level above spot
-    distance_to_spot_normalized: float  # signed, as fraction of expected_move_1d
-    role: PeakRole                   # Support / Resistance / Broken (function of price location)
+    distance_to_spot_normalized: float  # as a multiple of expected_move_1d
+    role: str                        # Support / Resistance (by price location; Broken planned)
 
 @dataclass
 class WallInfo:
-    peak: GammaPeak                  # the underlying peak — all geometry comes from here
-    test_count_today: int            # 0 = untested, 1 = first test, 2+ = degraded
-    distance_dollars: float          # dealer hedging $ for 1-pt spot move; see "Wall dollar impact"
-    confidence: float                # dominance vs. next-highest peak (separation factor)
+    peak: GammaPeak
+    confidence: float                # dominance vs. next-highest peak in the same ranking
+    test_count_today: int            # (planned) 0 = untested, 1 = first test, 2+ = degraded
+    distance_dollars: float          # (planned) see "Wall dollar impact"
 
 class GammaRegime(Enum):
-    Positive       # spot well above ZG, mean-reverting environment
-    Negative       # spot well below ZG, trend-amplifying environment
-    Battleground   # spot within tolerance of ZG, no clear regime
-    Transitioning  # spot just crossed ZG with conviction (within last N runs) — TRADEABLE event
+    Positive       # spot well above DP, mean-reverting environment
+    Negative       # spot well below DP, trend-amplifying environment
+    Battleground   # spot within tolerance of DP, no clear regime
+    Transitioning  # (planned) spot just crossed DP with conviction (within last N runs) — TRADEABLE event
 ```
 
 ### Normalization basis
 
-`expected_move_1d` is the ATM-straddle-implied 1-day move for the underlying, computed from the nearest-expiry ATM call+put mid prices summed and divided by spot (the standard straddle approximation). It is computed **inside this service** rather than imported from a separate vol module, because every normalized distance field (`distance_to_zg_normalized`, `distance_to_spot_normalized`, the Battleground/high-confidence regime thresholds) depends on it.
+`expected_move_1d` is the ATM straddle mid at the nearest expiry with two-sided quotes, scaled to one trading day (`÷ √trading days to expiry`), in points. Every normalized distance field and the regime thresholds depend on it. It is **not** in the pack; the v2 format has no implied-move slots.
 
-The "implied moves" we explicitly drop are the *display* fields that v1 surfaces (1D + 1W IV-derived moves emitted as paste-pack tokens 14–15). Those continue to be produced in `output/paste_pack.py` from the same ATM-straddle calculation — there is exactly one source of truth for the number.
-
-### Wall dollar impact
+### Wall dollar impact (planned)
 
 `WallInfo.distance_dollars` is the dealer hedging dollars implied by a 1-point move of spot through the wall:
 
@@ -135,7 +172,9 @@ Contract multipliers: SPX cash = 100, MES = 5, NQ = 20, MNQ = 2. This field is p
 
 ## How this plugs into AJ's existing stack
 
-**Cadence (through Phase 4).** The service runs as a discrete job — once daily by default, optionally on a manual or cron-driven cadence. A "run" is the unit of intraday state: `transition_lookback_runs` counts service invocations, not market bars. Phase 6+ may introduce bar-driven updates; this section describes pre-Phase-6 behavior.
+**Path today:** service → `gex_pack.txt` → `GexLevelsPastePack.cs` (hot-reloads within one bar) → its `CurrentGammaRegime` and proximity API → `ConfluenceAlertSystem`. Anything the pack can't carry (continuous magnitudes, half-widths, regime confidence, and later charm and wall tests) goes through the JSON, which needs a separate NT8 reader (Phase 6).
+
+**Cadence.** A discrete job, once daily by default. Open interest is published overnight, so a **pre-market run** (around 08:45 ET) should pick up the prior session's final OI, while a post-close run uses OI from the day before. Verify this by diffing an evening and a morning snapshot (raw archives are timestamped for this). A "run" is the unit of intraday state: `transition_lookback_runs` counts service invocations, not market bars.
 
 ### ConfluenceAlertSystem integration
 
@@ -178,109 +217,70 @@ RegimeClassifierV1 already classifies price-action regime (trending/ranging) fro
 
 ### LevelTracker complement
 
-LevelTracker handles dynamic intraday levels (VWAP bands, ORB, prior session H/L/C, London session). GEX Analysis Service handles options-derived structural levels. Both feed into ConfluenceAlertSystem; neither replaces the other. The high-confidence trades will be where dynamic LevelTracker levels coincide with GEX peaks — explicit cross-confirmation.
+LevelTracker handles dynamic intraday levels (VWAP bands, ORB, prior session H/L/C, London session). GEX levels are options-derived structural levels. Both feed into ConfluenceAlertSystem; neither replaces the other. The high-confidence trades will be where dynamic LevelTracker levels coincide with GEX peaks — explicit cross-confirmation.
 
 ---
 
-## Design principles (the choices we're making different from GEXBot)
+## Design principles
 
-1. **Continuous over discrete wherever possible.** Magnitude is a number; expose it as a number. Distance is a number; normalize it but keep it numeric. Let downstream consumers set their own thresholds.
-
-2. **Variable count over fixed count.** Some days have 3 meaningful peaks per side, some have 7. The peak count itself is information about market structure (concentrated vs. distributed positioning).
-
+1. **Continuous over discrete wherever possible.** Magnitude is a number; expose it as a number (in JSON). The pack's fixed ranks are a compatibility constraint, not a design choice.
+2. **Variable count over fixed count.** Some days have 3 meaningful peaks per side, some have 7. The peak count itself is information about market structure.
 3. **Profile data over peak prices alone.** Width matters, gradient matters. A "wide diffuse call wall from 7320–7360" trades very differently than a "single-strike spike at 7330."
-
-4. **Time-of-day is first-class.** Compute charm and vanna; weight by remaining trading time; recognize that the same Call Wall is more constraining at 15:50 than at 10:00.
-
-5. **State persists across runs within a day.** Wall test counts, regime transitions, charm intensity — these are time series, not single snapshots. The service should remember what happened earlier in the day.
-
-6. **Multiple greeks, not just gamma.** Charm and vanna are computationally cheap to add once you have the chain. They're independently actionable.
-
+4. **Time-of-day is first-class.** Compute charm and vanna; weight by remaining trading time; the same Call Wall is more constraining at 15:50 than at 10:00.
+5. **State persists across runs within a day.** Wall test counts, regime transitions, charm intensity — these are time series, not single snapshots.
+6. **Multiple greeks, not just gamma.** Charm and vanna are cheap once you have the chain, and independently actionable.
 7. **OI vs. Volume separately tracked.** They answer different questions; conflating them loses information.
-
-8. **Validation is empirical edge, not vendor parity.** We're not trying to match GEXBot. We're trying to produce data that, when fed into the trading system, improves PnL. Validation is backtest + live use, not "does our ZG match theirs."
+8. **Vendor semantics, our numbers; edge decides.** Match what each level *means*; judge methodology by trading results (Layer 3), not by matching the vendor's exact values.
 
 ---
 
 ## Output contracts
 
-**Timezones.** All wall-clock fields (`timestamp`, `minutes_to_close`, time-of-day window boundaries, charm-intensity calibration anchor) are `America/New_York`. The `YYYY-MM-DD` portion of filenames is the **US equity trading-session date** for the analysis, not UTC. Sessions that span midnight UTC still belong to a single ET trading-session date.
+**Timezones.** All wall-clock fields are `America/New_York`. The date in output filenames and the pack's date line is the **trading session the levels are for**. A snapshot taken at or after the 16:00 close feeds the next weekday; exchange holidays aren't modeled yet. Raw archives are named by fetch time instead.
 
-### Primary output: `analysis_YYYY-MM-DD.json`
+### `gex_pack.txt` — the NT8 contract (see `docs/GEX-PACK-SPEC.md`)
 
-Full `GexAnalysis` object serialized as JSON. This is the source of truth for v2 consumers.
+Implemented in `output/pack.py`:
 
-```json
-{
-  "timestamp": "2026-05-04T16:30:00-04:00",
-  "underlying": "SPX",
-  "spot": 7225.50,
-  "expected_move_1d": 46.24,
-  "regime": "Positive",
-  "regime_confidence": 0.78,
-  "zero_gamma": 7108.50,
-  "distance_to_zg_pts": 117.0,
-  "distance_to_zg_normalized": 2.53,
-  "gamma_gradient_at_spot": -2340.5,
-  "call_wall": {
-    "peak": {
-      "strike": 7330.0,
-      "magnitude_normalized": 1.0,
-      "half_width_pts": 8.0,
-      "role": "Resistance"
-    },
-    "test_count_today": 0,
-    "confidence": 0.92,
-    "distance_dollars": 169102875.0
-  },
-  "call_peaks": [...],
-  "put_peaks": [...],
-  "charm_intensity": 0.15,
-  "near_close_warning": false,
-  ...
-}
-```
+- **Sections:** `[REFS]` (one `SYMBOL price` line per ETF and futures symbol), `[PACK]` (date line + blocks), `[PRIOR]` (the previous session's `[PACK]`, rolled automatically when the session date changes; kept on a same-session rerun).
+- **Blocks, in order:** `ES, MES, NQ, MNQ, RTY, SPX, SPY, NDX, QQQ, RUT, IWM`. Each is `SYMBOL=` followed by 12 `|`-separated values in slot order CW, PW, TL, GD1–4, C1–4, DP, written at full precision. `0` means not available.
+- **Invariant A:** MES ≡ ES and MNQ ≡ NQ, byte-identical.
+- **Invariant B:** each futures block is its index block plus one basis at every slot. The basis is the index options' put-call-parity implied forward at the front quarterly futures expiry (rolled 8 days early), minus spot. On 25 Sep: ES–SPX 62.65 vs the vendor's 63.
+- **Invariant C:** ETF blocks are the ETF chain's own levels. The indicator converts them.
+- **The `RUT` block is included,** which gives RTY charts full IWM overlay support (spec §3 gotcha).
+- **Refs:** futures ref = index spot + basis, so `ratio = (futures_ref − basis) / etf_ref = index / ETF` at the same instant.
+- **Written atomically** (temp file + `os.replace`, retried briefly if NT8 is mid-read on Windows).
+- A mirror of the indicator's reader (`read_pack_file`, `derive_basis`, `derive_ratio`, `etf_to_futures`) backs the tests, including the spec's §4 worked example.
 
-### Compatibility output: `pack_YYYY-MM-DD.txt`
+**Rollout:** write to a separate file (e.g. `gex_pack_service.txt`) and point a second MES chart instance's *Pack File Path* at it. Compare it against the vendor-fed chart and with `python -m gex_analysis.compare` daily, then switch the main charts over.
 
-The 16-token paste pack format, generated from the same underlying analysis. Lets the existing OutsideRedge GEX Levels TradingView indicator keep working without changes during the v2 transition.
+### JSON: `output/analysis_<SYMBOL>_<session>.json`
 
-**Verification path.** The OutsideRedge indicator is closed-source Pine script; we cannot inspect its parser. The mapping from `GexAnalysis` → paste pack tokens must therefore be verified **empirically** against labeled screenshots AJ provides from the current scanner output (Phase 5). The provisional mapping below is a best guess from the reference packs in this doc; **do not ship without round-trip verification** because v1's L1–L4 / C1–C4 slot semantics (top-by-magnitude vs. nearest-by-distance vs. ordered-from-spot) cannot be confirmed from the indicator code:
+One file per symbol plus `SPX_SPY` (see "Index + ETF siblings"), containing the implemented subset of `GexAnalysis`.
 
-- Tokens 3, 4: `call_wall.peak.strike`, `put_wall.peak.strike`
-- Token 5: Vol Trigger — derived from vanna profile (the spot where vanna sign flips)
-- Token 6–9 (L1-L4): top 4 put-side peaks by magnitude (or fewer, padded with zeros if not enough qualifying peaks)
-- Token 10–13 (C1-C4): top 4 call-side peaks by magnitude (similarly padded)
-- Token 14, 15: ATM straddle-derived 1D and 1W expected moves (same source as `expected_move_1d`)
-- Token 16: `zero_gamma`
+### Future output: NT8 JSON ingestion (Phase 6)
 
-Note: when v2 emits more than 4 peaks per side, the paste pack only carries the top 4. **The richer JSON has all of them.**
-
-### Future output: NT8 file ingestion
-
-Phase 5+: replace the daily paste-pack workflow with NT8 reading the JSON directly via a new indicator or AddOn. This unlocks intraday updates and the full data model. Don't build this until the JSON-consuming side has proven its value.
+An NT8 reader for the JSON (a new indicator, or an extension of `GexLevelsPastePack.cs`) for data the pack can't carry. Don't build it until something in the JSON has proven worth trading on.
 
 ---
 
 ## Data source
 
-**POC source: CBOE delayed quotes JSON**: `https://cdn.cboe.com/api/global/delayed_quotes/options/{_SPX|SPY|_NDX|QQQ|_RUT|IWM}.json` (indexes take a leading underscore, ETFs don't). It's free with no key or account, and implemented in `data_sources/cboe.py`.
+**CBOE delayed quotes JSON**: `https://cdn.cboe.com/api/global/delayed_quotes/options/{_SPX|SPY|_NDX|QQQ|_RUT|IWM}.json` (indexes take a leading underscore, ETFs don't). It's free with no key or account, and implemented in `data_sources/cboe.py`.
 
-- **Fields per contract:** OCC symbol (root, expiry, C/P, strike), IV, open interest, volume, bid/ask, delta/gamma/vega/theta. SPX has about 29k contracts and SPY about 13k.
-- **Freshness:** 15-minute delayed. After the close, and on weekends, it serves the last session's values, which is the right snapshot for an end-of-day job.
-- **Caveats:** It's an unofficial, undocumented endpoint with no SLA; fine for personal use, but it could change or be blocked. It has no history (hence the raw-snapshot archive). CBOE's greeks are rounded to 4 decimals, so we compute gamma ourselves from IV. It has index options only (no ES/MES options), so MES levels = SPX levels + the ES–SPX basis.
+- **Fields per contract:** OCC symbol (root, expiry, C/P, strike), IV, open interest, volume, bid/ask, delta/gamma/vega/theta. SPX has about 29k contracts, SPY about 13k, NDX 15k, RUT 11k.
+- **Settlement times:** AM-settled monthly roots (SPX, NDX, RUT) expire at 09:30; weeklies and ETFs at 16:00. Time to expiry is DST-correct.
+- **Freshness:** 15-minute delayed. After the close, and on weekends, it serves the last session's values.
+- **Futures basis comes from the same data** (implied forward; see above). No futures feed is needed, so Tickstream isn't required.
+- **Caveats:** It's an unofficial, undocumented endpoint with no SLA; fine for personal use, but it could change or be blocked. It has no history (hence the raw-snapshot archive). CBOE's greeks are rounded to 4 decimals, so we compute gamma ourselves from IV. It has index options only (no ES/MES options), which is why futures levels = index levels + basis.
 - **Upgrade paths**, if it breaks or we outgrow it: Schwab Developer API (free with an account), Tradier production ($10/mo), Marketdata.app Starter ($12/mo, 1-credit cached mode). Each is one new `DataSource` subclass.
-- **Ruled out:** Polygon free (no options), Tradier sandbox (no greeks), Marketdata.app free (per-contract credits can't cover a full chain), E*TRADE (daily interactive re-auth), Tickstream (options need a $29/mo plan; stream sampling rather than snapshots).
+- **Ruled out:** Polygon free (no options), Tradier sandbox (no greeks), Marketdata.app free (per-contract credits can't cover a full chain), E*TRADE (daily interactive re-auth), Tickstream options (a $29/mo plan; stream sampling rather than snapshots).
 
-### Index + ETF siblings (SPX + SPY)
+### Index + ETF siblings
 
-SPY options carry real positioning that SPX alone misses, and SPY traders watch SPY's own round strikes. Each run produces three views:
+The pack carries each index and its ETF **separately** (Invariant C), and the indicator's ETF overlay draws the ETF's levels on the futures chart, tagging confluence (`+SPY DP`) where they land near a native level. That overlay is where the ETF's signal shows up in trading.
 
-1. `SPX`: standalone, at SPX strikes.
-2. `SPY`: standalone, at SPY strikes.
-3. `SPX_SPY`: SPY's per-strike GEX mapped onto the SPX scale (strike × `SPX_spot / SPY_spot`, binned to 5 points) and added to SPX. Dollar GEX per 1% is directly additive. Zero gamma for the combined view re-evaluates both chains at each hypothetical spot.
-
-Comparing view 3 against view 1 shows where ETF positioning actually moves a level.
+The JSON also has a research-only `SPX_SPY` view: SPY's per-strike GEX mapped onto the SPX scale (strike × `SPX/SPY`, binned to 5 points) and added to SPX. Dollar GEX per 1% is directly additive. On 25 Sep, SPY added about 3.5% to SPX's dollar gamma and moved DP by +7 pts. It's not in the pack.
 
 ---
 
@@ -288,47 +288,40 @@ Comparing view 3 against view 1 shows where ETF positioning actually moves a lev
 
 ```
 gex_analysis/
+├── config.py                    # GexConfig methodology knobs + COMPLEXES (index, ETF, futures)
+├── main.py                      # daily orchestrator: fetch, archive, compute, JSON + pack
+├── compare.py                   # vendor pack vs ours, slot by slot
 ├── data_sources/
-│   ├── __init__.py
-│   ├── base.py                  # DataSource ABC: fetch_chain(), fetch_spot(), fetch_rate()
-│   └── <provider>.py            # implementation depending on AJ's available APIs
+│   ├── base.py                  # Chain dataclass, DataSource ABC
+│   └── cboe.py                  # CBOE delayed quotes: OCC parsing, settlement times
 ├── compute/
-│   ├── greeks.py                # BS gamma, charm, vanna — vectorized
-│   ├── per_strike.py            # aggregate per-contract greeks to per-strike profile
-│   ├── peaks.py                 # peak detection above relative threshold
-│   ├── walls.py                 # major wall identification + half-width + confidence
-│   ├── zero_gamma.py            # numerical root-find with hysteresis-aware regime gating
-│   ├── vanna_trigger.py         # vol trigger from vanna profile
-│   ├── gradient.py              # d_GEX/d_K at spot (numerical or analytical)
-│   ├── regime.py                # GammaRegime classification + transition detection
-│   ├── expected_move.py         # ATM straddle 1D/1W moves (one source for JSON + paste pack)
-│   ├── combine.py               # map ETF (SPY) GEX onto the index (SPX) scale and sum
-│   └── time_of_day.py           # charm intensity, expiry weighting curve, close warnings
-├── state/
-│   ├── __init__.py
-│   ├── intraday.py              # tracks wall test counts, regime transitions, profile changes
-│   └── persistence.py           # JSON-on-disk per session-date
-├── output/
-│   ├── analysis.py              # GexAnalysis dataclass + JSON serialization
-│   ├── paste_pack.py            # v1 compat output
-│   └── push_to_nt.py            # file-watcher integration (Phase 5+)
-├── validation/
-│   ├── unit/                    # closed-form math tests
-│   ├── empirical/               # backtest setup quality vs. forward returns
-│   ├── reference_packs/         # historical GEXBot packs (for sanity comparison only)
-│   └── methodology_compare.py   # A/B sign convention / expiry weight knobs
-├── config.py                    # methodology knobs (all empirical decisions are config)
-├── main.py                      # daily orchestrator
-└── tests/
+│   ├── greeks.py                # BS gamma, vectorized (charm, vanna planned)
+│   ├── per_strike.py            # ContractSet: DTE-window filter, dealer $GEX per contract and per strike
+│   ├── peaks.py                 # greedy peak ranking + half-widths
+│   ├── walls.py                 # wall confidence
+│   ├── zero_gamma.py            # shift-spot zero gamma (DP, TL)
+│   ├── basis.py                 # front quarterly expiry, implied forward, futures basis
+│   ├── expected_move.py         # ATM straddle 1-day move
+│   ├── regime.py                # GammaRegime classification
+│   └── combine.py               # ETF GEX mapped onto the index scale (research view)
+└── output/
+    ├── analysis.py              # GexAnalysis dataclasses + JSON
+    └── pack.py                  # gex_pack.txt writer + mirror reader
+docs/GEX-PACK-SPEC.md            # NT8 pack contract (wins on format)
+validation/reference_packs/      # vendor packs for comparison
+tests/                           # pytest: math, parsing, basis, pack invariants, spec §4 example
+data/raw/, output/               # generated; not in git (back up data/raw — it's our history)
 ```
+
+Planned additions: `compute/time_of_day.py` (charm intensity), `compute/gradient.py`, `state/intraday.py` and `state/persistence.py` (wall tests, regime transitions).
 
 ### `compute/zero_gamma.py` — definition
 
-**Definition.** Zero gamma is the spot value `S*` such that **total dealer GEX, recomputed by shifting all greeks to that spot**, equals zero — i.e. we re-evaluate the chain's gamma at hypothetical spots across a search grid spanning `spot × (1 ± zg_search_range_pct)`, build a signed-GEX function of spot, and root-find with `scipy.optimize.brentq`. This is distinct from the cumulative-profile-crossing definition, which uses today's per-strike GEX cumsum at a fixed spot; the two can give materially different answers and we commit to the shift-spot definition.
+**Definition.** Zero gamma is the spot value `S*` where **total dealer GEX, recomputed with every contract's gamma re-evaluated at that spot** (IV held per contract), equals zero. We evaluate a grid across `spot × (1 ± zg_search_range_pct)` and root-find each sign change with `scipy.optimize.brentq`; the crossing nearest spot wins. The same function gives both pivots from different expiry sets: DP from `structural_window_dte`, TL from `transition_window_dte`. The cumulative-profile-crossing definition was tested and rejected.
 
-**Hysteresis.** A regime transition (`Transitioning`) is declared only when spot crosses ZG by more than `zg_hysteresis_pts` (config, default 5.0). The crossing flag and its run-count are persisted in intraday state so a single near-ZG oscillation does not flip regime repeatedly.
+**Hysteresis (planned).** A regime transition (`Transitioning`) is declared only when spot crosses DP by more than `zg_hysteresis_pts` (default 5.0). The crossing flag and its run-count are persisted in intraday state so a single near-DP oscillation does not flip regime repeatedly.
 
-### `compute/time_of_day.py` — `charm_intensity` formula
+### `compute/time_of_day.py` — `charm_intensity` formula (planned)
 
 ```
 charm_intensity = clip(
@@ -339,257 +332,182 @@ charm_intensity = clip(
 )
 ```
 
-Where `minutes_open_to_close` is the full session length (typically 390 for US equity cash) and `minutes_left_to_close` is the remaining minutes in the regular session. `charm_intensity_normalizer` is calibrated once during Phase 3 against an end-of-day reference value at 15:50 ET on a representative day and pinned in `GexConfig`. The intensity is near zero at the open (large denominator) and rises through the day as remaining time shrinks.
+Where `minutes_open_to_close` is the full session length (typically 390 for US equity cash) and `minutes_left_to_close` is the remaining minutes in the regular session. `charm_intensity_normalizer` is calibrated once during Phase 3 against an end-of-day reference value at 15:50 ET on a representative day and pinned in `GexConfig`. The intensity is near zero at the open and rises through the day as remaining time shrinks.
 
-### `state/intraday.py` — wall test semantics
+### `state/intraday.py` — wall test semantics (planned)
 
 A "test" of a wall increments `walls_tested_today[strike]` when spot enters within `wall_test_proximity_strikes` of the wall AND subsequently exits that band by at least `wall_test_retreat_strikes`. Without the retreat requirement, sideways drift inside the band would inflate counts. Tracking is per-strike, per-session-date. The "currently inside the band" flag is part of intraday state and persists across runs.
 
-### `state/persistence.py` — store choice
+### `state/persistence.py` — store choice (planned)
 
-State is persisted as one JSON file per trading-session date under `state/YYYY-MM-DD.json`. SQLite was considered and **deferred** — a single-writer daily process does not justify the extra moving part. Revisit only if Phase 6+ introduces concurrent intraday writers or cross-session queries.
+State is persisted as one JSON file per trading-session date under `state/YYYY-MM-DD.json`. SQLite was considered and **deferred** — a single-writer daily process does not justify the extra moving part.
 
-### Methodology knobs in `config.py`
+### Methodology knobs
+
+Implemented in `gex_analysis/config.py`:
 
 ```python
 @dataclass
 class GexConfig:
-    # Sign convention (verify empirically). Standard GEX convention: customers sell calls and buy
-    # puts, so dealers are long calls (+GEX) and short puts (-GEX). The original draft had these
-    # inverted, which would flip every sign and the regime definitions below.
-    dealer_long_calls: bool = True
-    dealer_short_puts: bool = True
+    dealer_long_calls: bool = True            # standard convention: dealers long calls (+GEX)...
+    dealer_short_puts: bool = True            # ...and short puts (-GEX)
 
-    # Pricing inputs
-    risk_free_rate: float = 0.04
-    dividend_yields: dict[str, float] = {"SPX": 0.0, "SPY": 0.012}
+    structural_window_dte = (0, 365)          # walls, GD, C, DP
+    transition_window_dte = (0, 7)            # TL
+    min_time_to_expiry_minutes = 15.0         # floor so 0DTE gamma doesn't explode near the close
 
-    # Expiry handling
-    expiry_window_dte: tuple[int, int] = (0, 30)  # calendar-day DTE, inclusive
-    min_time_to_expiry_minutes: float = 15.0      # floor so 0DTE gamma doesn't explode near the close
-    expiry_weighting: Literal['none', 'linear_decay', 'sqrt_decay'] = 'sqrt_decay'
+    risk_free_rate = 0.04
+    dividend_yields = {"SPX": 0, "NDX": 0, "RUT": 0, "SPY": 0.012, "QQQ": 0.006, "IWM": 0.012}
 
-    # Time-of-day adjustment
-    charm_weight_starts_at_minutes_to_close: int = 180
-    near_close_warning_threshold_minutes: int = 30
-    charm_intensity_normalizer: float = 1.0  # calibrated in Phase 3
+    support_rank_source = "put"               # GD1-4: "put" | "net"
+    resistance_rank_source = "net"            # C1-4: "call" | "net"
+    peak_relative_threshold = 0.20            # peaks must be >= 20% of the strongest in the ranking
+    peak_min_separation_pct = 0.0025          # of spot
+    wall_dominance_threshold = 1.5            # wall confidence reaches 1.0 at 1.5x the runner-up
 
-    # Peak detection
-    peak_relative_threshold: float = 0.20  # peaks must be >= 20% of max magnitude
-    peak_min_separation_pct: float = 0.0025  # of spot; works across SPX ($5 grid) and SPY ($1 grid)
+    zg_search_range_pct = 0.10
+    zg_grid_points = 161
 
-    # Wall confidence
-    wall_dominance_threshold: float = 1.5  # major wall must be >= 1.5x next runner-up
+    regime_battleground_normalized = 0.5      # |dist to DP| / expected move within this = Battleground
+    regime_high_confidence_normalized = 2.0   # beyond this = full confidence
 
-    # Wall test counting
-    wall_test_proximity_strikes: float = 3.0
-    wall_test_retreat_strikes: float = 2.0
+    combined_strike_step = 5.0                # SPX_SPY research view binning
 
-    # Zero gamma search
-    zg_search_range_pct: float = 0.10
-    zg_grid_points: int = 161
-    zg_hysteresis_pts: float = 5.0
-    transition_lookback_runs: int = 5  # how recent a ZG cross is "Transitioning" (in service runs)
-
-    # Regime
-    regime_battleground_normalized: float = 0.5  # |dist/exp_move| within this = Battleground
-    regime_high_confidence_normalized: float = 2.0  # beyond this = full confidence
-
-    # Index + ETF combined view
-    combined_strike_step: float = 5.0  # ETF strikes are mapped to the index scale and binned to this grid
+    futures_roll_days = 8                     # roll to the next quarterly expiry this many days early
+    basis_strike_range_pct = 0.03             # strikes used for the implied forward
 ```
 
-The POC implements the subset of these knobs it needs in `gex_analysis/config.py`.
+Planned knobs: `expiry_weighting`, `charm_weight_starts_at_minutes_to_close = 180`, `near_close_warning_threshold_minutes = 30`, `charm_intensity_normalizer`, `wall_test_proximity_strikes = 3.0`, `wall_test_retreat_strikes = 2.0`, `zg_hysteresis_pts = 5.0`, `transition_lookback_runs = 5`.
 
 ---
 
 ## Phased build plan
 
-The phasing is structured so each phase produces a verifiable artifact and can ship independently. Don't move to N+1 until N is observable in production.
+Each phase produces a verifiable artifact and can ship independently. Don't move to N+1 until N is observable in production.
 
-### Phase 0: Scope confirmation — ✅ done
-- Data source chosen: CBOE delayed quotes JSON (see "Data source"). SPX, SPY, NDX, RUT, QQQ and IWM verified.
-- Per contract: strike, expiry, type, OI, volume, IV, bid/ask, delta/gamma/vega/theta. IV is per strike; OI is populated across strikes.
+### ✅ Phase 0: Data source
+CBOE delayed quotes verified for all six chains (see "Data source").
 
-**POC status:** Phase 1 plus the Phase 2 slice (peaks, walls, zero gamma, basic regime) is implemented for SPX, SPY and a combined SPX+SPY view. Not yet: `gamma_gradient_at_spot`, `distance_dollars`, charm/vanna, intraday state, paste pack.
+### ✅ Phase 1–2: Profile, walls, ranks, pivots, regime
+Per-strike dealer GEX, net walls, GD/C ranks, DP and TL, basic regime, JSON output. Definitions and evidence are under "Level definitions".
 
-### Phase 1: Per-strike gamma profile (the foundation)
-- Implement BS gamma in `compute/greeks.py` (vectorized via py_vollib_vectorized)
-- Compute per-strike GEX summed across the configured expiry window
-- Implement `compute/expected_move.py` (needed for normalized distances from Phase 2)
-- Output: a JSON file with `gamma_profile` only (just the dict[strike, GEX])
-- **Verify:** plot the profile, eyeball it for shape, confirm peaks are at strikes with high OI
-- **Sanity (not calibration).** Compare computed Zero Gamma to GEXBot's published ZG for the same date. Order-of-magnitude agreement (within ~1% of spot) suggests the math is wired correctly. **Persistent disagreement is not a failure** — sign convention, expiry window, and weighting differ. Do not tune knobs to match GEXBot; that's a Phase 7 empirical question.
+### ✅ Phase 5 (pulled forward): `gex_pack.txt` for all complexes
+The spec showed the NT8 indicator already provides the integration, so the pack moved ahead of Phases 3–4. It includes all three complexes, the implied-forward basis, auto-rolled `[PRIOR]`, atomic writes and the vendor comparison tool.
 
-### Phase 2: Variable peaks + walls + regime
-- Add peak detection (`compute/peaks.py`) with relative magnitude threshold
-- Add wall identification with half-width and confidence (`compute/walls.py`)
-- Add zero gamma root-find (`compute/zero_gamma.py`) using the shift-spot definition
-- Add basic regime classification (`compute/regime.py` — without transition detection yet)
-- Output: complete `GexAnalysis` JSON minus charm/vanna/state
-- **Verify:** levels look "right" — eyeball against GEXBot for sanity, but don't constrain to match exactly
+### ▶ Next: side-by-side validation (1–2 weeks)
+- Run pre-market daily (Windows Task Scheduler on the NT8 machine), writing to `gex_pack_service.txt` on a second MES chart.
+- Keep pasting the vendor pack as usual. Run `compare` daily and save the output.
+- Diff an evening vs morning snapshot to confirm when CBOE's OI refreshes.
+- Then decide on per-symbol windows (NDX, IWM), whether the C definition needs rework, and when to switch the main charts over.
 
 ### Phase 3: Charm and vanna
-- Add charm and vanna in `compute/greeks.py`
-- Add charm-intensity time weighting in `compute/time_of_day.py`; calibrate `charm_intensity_normalizer`
-- Add vol trigger from vanna profile (`compute/vanna_trigger.py`)
+- Add charm and vanna in `compute/greeks.py`; charm-intensity time weighting in `compute/time_of_day.py`; calibrate `charm_intensity_normalizer`
 - Add `near_close_warning` logic
-- Output: full `GexAnalysis` JSON for a single point in time
-- **Verify:** charm intensity should be near-zero at 9:30 AM and approach 1.0 at 15:50 — eyeball the curve
+- **Verify:** charm intensity near zero at 9:30 AM and approaching 1.0 at 15:50
 
 ### Phase 4: Intraday state — the differentiator
-- Add `state/intraday.py` for wall test counting (with proximity + retreat semantics) and regime transition detection
-- Add `state/persistence.py` (JSON-per-session-date) to carry state across multiple daily runs
-- Wire into output: `walls_tested_today`, `regime` includes `Transitioning` state, ZG hysteresis active
-- **Verify:** simulate a day with multiple wall tests, confirm count increments correctly only on enter-then-retreat cycles
+- `state/intraday.py` for wall test counting (proximity + retreat) and regime transition detection with DP hysteresis
+- `state/persistence.py` (JSON-per-session-date) to carry state across runs
+- Needs intraday runs (the CBOE feed refreshes every 15 minutes)
+- **Verify:** simulate a day with multiple wall tests, confirm counts increment only on enter-then-retreat cycles
 
-### Phase 5: Multi-symbol output + paste-pack compat
-- Extend to NDX and RUT chains
-- Implement `output/paste_pack.py` to emit v1-compatible paste pack alongside JSON
-- **Confirm token mapping empirically against labeled screenshots from AJ's current scanner** before shipping; provisional mapping in "Output contracts" may need to change. The OutsideRedge indicator is closed Pine — no source available.
-- Wire daily orchestrator (`main.py`) to produce both files
-- **Verify:** paste the v2-generated pack into the live OutsideRedge indicator and confirm each level renders at the expected strike with the expected label (Call Wall / Put Wall / L1–L4 / C1–C4 / ZG / VT). Repeat across at least 5 trading days with diverse profiles.
-
-### Phase 6: NT8 ingestion (the integration phase)
-- New NT8 indicator (`GexAnalysisV2`) that consumes the JSON directly — same platform as `ConfluenceAlertSystem`, no manual paste step
-- Exposes the richer data via public API to `ConfluenceAlertSystem` and `RegimeClassifierV1`
-- Run alongside the OutsideRedge TradingView indicator until AJ trusts the new visualization, then cancel the OutsideRedge subscription
-- **This is where the largest stack-level edge improvement comes from.** Until Phase 6, GEX is still a discretionary input; only here does it become a programmatic confluence input.
+### Phase 6: NT8 JSON ingestion
+An NT8 reader for the JSON fields the pack can't carry, feeding `ConfluenceAlertSystem` and `RegimeClassifierV1`. Only once Phase 3–4 data has shown value.
 
 ### Phase 7+: Empirical methodology refinement
-- A/B sign convention, expiry weighting, peak threshold
-- Backtest: compute setup quality scores using GEX inputs, compare PnL across config variants
-- This is where the long-term edge tuning happens
+- A/B sign convention, expiry windows and weighting, rank definitions
+- Backtest: setup quality scores using GEX inputs, PnL across config variants
 
 ---
 
-## Validation methodology (different from v1)
+## Validation methodology
 
-We're **not** trying to match GEXBot. So validation has three layers:
+### Layer 1: Math and contract correctness (unit tests, `pytest`)
+- Black-Scholes gamma matches the closed form; zero gamma matches an analytic call/put pair; peaks, half-widths, wall confidence, regime
+- OCC parsing, AM/PM settlement, DST-correct time to expiry
+- Implied forward recovers a parity-consistent forward; quarterly expiry roll
+- Pack: 12 slots, Invariants A and B, round trip, `[PRIOR]` roll, atomic write, date parsing, **spec §4 worked example**, and a parse of the real vendor file (including its bad QQQ ref)
 
-### Layer 1: Math correctness (unit tests)
-- Black-Scholes gamma at ATM matches closed-form value
-- Charm at zero time-to-expiry approaches infinity correctly
-- Zero gamma converges for synthetic profiles with known answers
-- Per-strike aggregation across expiries sums correctly
-- Wall test counter increments exactly once per enter→retreat cycle
-
-### Layer 2: Sanity (eyeball + GEXBot comparison, NOT calibration)
-- Computed Zero Gamma in the order-of-magnitude vicinity of GEXBot's published ZG (within ~1% of spot most days)
-- Major Call Wall and Put Wall match GEXBot's strikes for ~80% of days
-- Profile shape "looks right" — peaks at high-OI strikes
-- Charm intensity rises monotonically through the trading day
-
-If Layer 2 is wildly off (e.g., ZG is on the wrong side of spot, walls are at structurally implausible strikes), methodology is wrong; iterate config knobs. **If Layer 2 is in the rough vicinity but not matching exactly, that is expected and not a failure** — methodology differences from GEXBot are intentional.
+### Layer 2: Vendor comparison (daily, `compare`)
+- Slot-by-slot differences plus GD/C rank overlap for every symbol, and each complex's basis
+- Healthy: walls mostly exact, pivots within ~0.5% of spot, GD overlap ≥ 2/4
+- Persistent large misses on one symbol mean its definition or window needs work. Small differences are expected and not a failure.
 
 ### Layer 3: Empirical edge (the real validation)
-- Backtest historical setups using both v1 (GEXBot levels) and v2 (our richer levels) as ConfluenceAlertSystem inputs
-- Compare: does v2 produce better setup quality scores? Better PnL? Better expectancy?
-- **This is the only validation that ultimately matters.** Phases 1–6 produce data; Phase 7+ proves the data is worth more than v1.
+- Backtest historical setups using vendor levels vs ours as ConfluenceAlertSystem inputs
+- Compare setup quality scores, PnL, expectancy
+- **This is the only validation that ultimately matters.**
 
-Layer 3 needs historical chain data. The CBOE feed has no history, so **every run archives the raw snapshot** to `data/raw/<SYM>_<session-date>.json.gz` (about 2.4 MB/day for SPX + SPY). Running daily from the POC onward builds our own history for free. Keep that folder backed up; it isn't in git.
+CBOE has no history, so **every run archives the raw snapshots** to `data/raw/<SYM>_<fetch time>.json.gz` (about 4.5 MB per run for all six). Running daily builds our own history for free. Keep that folder backed up; it isn't in git.
 
 ---
 
 ## What to drop, defer, or rule out
 
 **Drop:**
-- Implied moves as a **first-class field** of `GexAnalysis`. They're IV-derived display values, not gamma. The v1 paste-pack tokens 14–15 still carry them (because the format requires it), generated by `compute/expected_move.py` — which also produces `expected_move_1d` for normalization. One source of truth, used in two places.
+- Implied moves in the pack (v2 has no slots for them). `expected_move_1d` stays in JSON for normalization.
+- The legacy 16-token pack format. The indicator still parses it for old packs, but we emit v2 only.
 
 **Defer:**
-- NDX/RUT support until SPX/MES is solid (Phase 5). They follow the SPX + SPY pattern: NDX + QQQ and RUT + IWM, each with standalone levels plus a combined index+ETF view (all six are on the same free CBOE feed).
-- Intraday updates (more frequent than once-daily) until daily output is proven valuable
-- Custom analytics like "gamma momentum" (rate of change of gamma profile) until base profile is reliable
-- SQLite-backed state (current plan: JSON files per session date)
+- Intraday runs until Phase 4 needs them
+- Custom analytics like "gamma momentum" until the base profile is proven
+- SQLite-backed state
+- Exchange-holiday calendar for session dates
 
 **Rule out:**
-- Trying to match GEXBot exactly. We're not. Set the expectation up front so we don't get stuck in calibration loops.
-- Building this in NinjaScript. Wrong tool. Python with vectorized greeks is the right home.
-- Coupling state persistence to a database. SQLite or even JSON files on disk are fine for the data volumes involved — see decision above.
+- Tuning knobs to chase the vendor's exact numbers
+- Building the computation in NinjaScript. Python is the right home; NT8 consumes files.
 
 ---
 
-## Open questions for AJ before Phase 0
+## Open questions for AJ
 
-1. ~~**Data source.**~~ **Answered:** CBOE's free delayed JSON for the POC. See "Data source".
-2. **Compute environment.** Local machine running daily? Cloud VM? Schedule via cron, Windows Task Scheduler, or run manually?
-3. **Output destination.** File on disk that NT8 reads? Push to a directory NT8 watches? HTTP endpoint? Daily email?
-4. **Existing TradingAgents tooling.** Does the TauricResearch repo have any options data adapters or chain handlers worth reusing?
-5. **Chain expiry universe.** When you've used GEX in trading, has it felt like 0DTE-driven dynamics matter most, or do longer-dated levels feel structural to you? This shapes the default `expiry_window_dte` config.
-6. **Backtest data.** Do you have historical option chain data (or budget for it) anywhere? This unlocks Layer 3 validation. If not, we'll plan around forward-only validation.
-7. ~~**Latency budget.**~~ **Answered:** daily/end-of-day for now, possibly forever. More frequent runs only if they prove their value. The CBOE feed refreshes every 15 minutes, so light intraday runs are possible without switching sources.
+1. **Where does the service run?** It has to write where NT8 reads (`Documents\NinjaTrader 8\`), so most likely the NT8 Windows machine via Task Scheduler, pre-market.
+2. **Vendor pack dating.** Is the pack labelled "25 september 2026" the one you traded *on* the 25th? We assume yes: the date line is the target session.
+3. **Chain expiry universe.** Does 0DTE-driven behaviour feel dominant, or do longer-dated levels feel structural? This bears on TL/DP windows, alongside the daily comparisons.
+4. **C levels.** Do you trade the C1–4 levels much? The vendor's aren't reproducible yet. If they matter, send a few more days of vendor packs.
+5. **Backtest data.** Any historical option chain data (or budget for it)? Otherwise Layer 3 runs forward on our own archive.
+6. **Existing TradingAgents tooling.** Any options adapters in the TauricResearch repo worth reusing?
+
+Answered: data source (CBOE delayed JSON), latency (daily, pre-market), output destination (`gex_pack.txt` for `GexLevelsPastePack.cs`).
 
 ---
 
 ## Reference companion files
 
-- **OutsideRedge "GEX Levels"** (TradingView, closed Pine — third-party paid indicator, not in our repo) — the v1 visualization. Defines the 16-token paste-pack format we maintain compatibility with. **Token slot semantics must be confirmed empirically (labeled screenshots from AJ's current scanner) before Phase 5 ships, since the source is not inspectable.** Public docs: https://outsideredge.com/docs/gamma-exposure-levels
-- `ConfluenceAlertSystem.cs` (NinjaTrader project) — the eventual consumer of v2 data. Look at its three-gate structure (Context → Location → Trigger) to understand how the GEX data should flow.
-- `RegimeClassifierV1.cs` (NinjaTrader project) — the regime classifier we'll stack with gamma regime to produce the 2x2 alignment signal.
-- `LevelTracker.cs` (NinjaTrader project) — the existing dynamic level tracker. v2 GEX levels complement these.
+- `docs/GEX-PACK-SPEC.md` — the pack contract, extracted from the live indicator.
+- `GexLevelsPastePack.cs` (NinjaTrader project) — the consumer: `ReadPackFile`, `ParseV2Blocks`, `ParsePackV2`, `BuildEtfOverlay`, `BuildPriorDayLevels`.
+- `ConfluenceAlertSystem.cs` (NinjaTrader project) — the three-gate structure (Context → Location → Trigger) GEX data flows into.
+- `RegimeClassifierV1.cs` (NinjaTrader project) — the price-action regime classifier we stack with gamma regime for the 2x2.
+- `LevelTracker.cs` (NinjaTrader project) — dynamic intraday levels; GEX levels complement these.
+- `validation/reference_packs/2026-09-25_vendor.txt` — AJ's live pack with the vendor's 25 Sep (`[PACK]`) and 24 Sep (`[PRIOR]`) levels, kept verbatim, including the `QQQ 7.45.4` ref typo.
+- OutsideRedge "GEX Levels" docs (https://outsideredge.com/docs/gamma-exposure-levels) — the TradingView product the pack format originated from; historical context only.
 
 ---
 
-## Reference paste packs (for v1 compat validation only)
+## Dependencies
 
-Save to `validation/reference_packs/`:
-
-`2026-04-30.txt`:
-```
-30 APRIL 2026 $SPX, SPX, 7200, 6800, 7095, 7000, 7150, 6000, 7100, 7200, 7300, 7400, 7222, 0.0064, 0.0151, 7041, $SPY, SPY, 720, 700, 710, 700, 710, 705, 715, 718.09, 728.05, 723.07, 738.01, 0.0064, 0.0151, 710, $NDX, NDX, 26700, 23500, 26690, 26700, 27000, 27500, 26500, 27731, 27948, 27540, 27323, 0.01, 0, 26313, $QQQ, QQQ, 675, 635, 654, 650, 660, 640, 645, 675.32, 649.68, 660.2, 679.93, 0.01, 0, 655, $RUT, RUT, 2725, 2680, 2700, 2700, 2680, 2725, 2750, 2679, 2718, 2619, 2668, 0.01, 0, 2732, $IWM, IWM, 280, 266, 272, 270, 260, 265, 275, 270.09, 279.95, 276.93, 266.25, 0.01, 0, 280, $ES1!, ES1!, 7230.05, 6830.05, 7125.05, 7030.05, 7180.05, 6030.05, 7130.05, 7230.05, 7330.05, 7430.05, 7252.05, 0.0064, 0.0151, 7071.05, $MES1!, MES1!, 7230.05, 6830.05, 7125.05, 7030.05, 7180.05, 6030.05, 7130.05, 7230.05, 7330.05, 7430.05, 7252.05, 0.0064, 0.0151, 7071.05, $NQ1!, NQ1!, 26857.27, 23657.27, 26847.27, 26857.27, 27157.27, 27657.27, 26657.27, 27888.27, 28105.27, 27697.27, 27480.27, 0.01, 0, 26470.27, $MNQ1!, MNQ1!, 26857.27, 23657.27, 26847.27, 26857.27, 27157.27, 27657.27, 26657.27, 27888.27, 28105.27, 27697.27, 27480.27, 0.01, 0, 26470.27, $RTY1!, RTY1!, 2731.92, 2686.92, 2706.92, 2706.92, 2686.92, 2731.92, 2756.92, 2685.92, 2724.92, 2625.92, 2674.92, 0.01, 0, 2738.92, $M2K1!, M2K1!, 2731.92, 2686.92, 2706.92, 2706.92, 2686.92, 2731.92, 2756.92, 2685.92, 2724.92, 2625.92, 2674.92, 0.01, 0, 2738.92
-```
-
-`2026-05-01.txt`:
-```
-1 MAY 2026 $SPX, SPX, 7200, 6800, 7070, 7000, 7200, 7150, 6000, 7202, 7303, 7252, 7396, 0.0063, 0.0151, 7060, $SPY, SPY, 720, 700, 713, 700, 710, 720, 715, 717.98, 727.95, 737.91, 720.12, 0.0063, 0.0151, 717, $NDX, NDX, 26700, 24500, 26690, 26700, 27000, 27500, 27300, 27754, 27974, 27562, 27507, 0.01, 0, 26570, $QQQ, QQQ, 675, 600, 664, 660, 675, 670, 650, 674.81, 680.1, 670.18, 664.89, 0.01, 0, 661, $RUT, RUT, 2785, 2680, 2700, 2800, 2785, 2750, 2700, 2820, 2680, 2800, 2870, 0.01, 0, 2751, $IWM, IWM, 280, 266, 273, 270, 280, 260, 275, 266.08, 269.89, 260.1, 265, 0.01, 0, 279, $ES1!, ES1!, 7231.05, 6831.05, 7101.05, 7031.05, 7231.05, 7181.05, 6031.05, 7233.05, 7334.05, 7283.05, 7427.05, 0.0063, 0.0151, 7091.05, $MES1!, MES1!, 7231.05, 6831.05, 7101.05, 7031.05, 7231.05, 7181.05, 6031.05, 7233.05, 7334.05, 7283.05, 7427.05, 0.0063, 0.0151, 7091.05, $NQ1!, NQ1!, 26840.13, 24640.13, 26830.13, 26840.13, 27140.13, 27640.13, 27440.13, 27894.13, 28114.13, 27702.13, 27647.13, 0.01, 0, 26710.13, $MNQ1!, MNQ1!, 26840.13, 24640.13, 26830.13, 26840.13, 27140.13, 27640.13, 27440.13, 27894.13, 28114.13, 27702.13, 27647.13, 0.01, 0, 26710.13, $RTY1!, RTY1!, 2793.98, 2688.98, 2708.98, 2808.98, 2793.98, 2758.98, 2708.98, 2828.98, 2688.98, 2808.98, 2878.98, 0.01, 0, 2759.98, $M2K1!, M2K1!, 2793.98, 2688.98, 2708.98, 2808.98, 2793.98, 2758.98, 2708.98, 2828.98, 2688.98, 2808.98, 2878.98, 0.01, 0, 2759.98
-```
-
-`2026-05-04.txt`:
-```
-4 MAY 2026 $SPX, SPX, 7300, 6800, 7195, 7000, 7200, 7150, 6000, 7302, 7396, 7274, 7353, 0.0064, 0.0149, 7080, $SPY, SPY, 725, 700, 720, 700, 710, 720, 725, 717.67, 727.73, 722.7, 737.07, 0.0064, 0.0151, 719, $NDX, NDX, 26700, 24500, 25550, 27000, 26700, 27500, 28000, 27960, 27738, 27987, 28154, 0.01, 0, 25829, $QQQ, QQQ, 680, 645, 669, 675, 680, 670, 660, 674.91, 680.25, 670.24, 668.91, 0.01, 0, 667, $RUT, RUT, 2850, 2680, 2780, 2800, 2700, 2750, 2785, 2869, 2818, 2849, 2678, 0.01, 0, 2785, $IWM, IWM, 280, 265, 272, 270, 260, 280, 275, 279.88, 265.98, 277.93, 284.88, 0.01, 0, 283, $ES1!, ES1!, 7328.52, 6828.52, 7223.52, 7028.52, 7228.52, 7178.52, 6028.52, 7330.52, 7424.52, 7302.52, 7381.52, 0.0064, 0.0149, 7108.52, $MES1!, MES1!, 7328.52, 6828.52, 7223.52, 7028.52, 7228.52, 7178.52, 6028.52, 7330.52, 7424.52, 7302.52, 7381.52, 0.0064, 0.0149, 7108.52, $NQ1!, NQ1!, 26814.64, 24614.64, 25664.64, 27114.64, 26814.64, 27614.64, 28114.64, 28074.64, 27852.64, 28101.64, 28268.64, 0.01, 0, 25943.64, $MNQ1!, MNQ1!, 26814.64, 24614.64, 25664.64, 27114.64, 26814.64, 27614.64, 28114.64, 28074.64, 27852.64, 28101.64, 28268.64, 0.01, 0, 25943.64, $RTY1!, RTY1!, 2855.31, 2685.31, 2785.31, 2805.31, 2705.31, 2755.31, 2790.31, 2874.31, 2823.31, 2854.31, 2683.31, 0.01, 0, 2790.31, $M2K1!, M2K1!, 2855.31, 2685.31, 2785.31, 2805.31, 2705.31, 2755.31, 2790.31, 2874.31, 2823.31, 2854.31, 2683.31, 0.01, 0, 2790.31
-```
-
----
-
-## Recommended dependencies
-
-```toml
-# Core math
-numpy = "*"
-scipy = "*"                    # brentq for ZG root-find, savgol for profile smoothing
-pandas = "*"
-requests = "*"                 # CBOE delayed feed
-# py-vollib-vectorized — not needed: closed-form BS gamma in numpy covers the POC; revisit for charm/vanna
-
-# State persistence
-# Just stdlib (json) — no extras needed (SQLite deferred)
-
-# Dev
-pytest = "*"
-pytest-cov = "*"
-
-# Optional orchestration
-schedule = "*"
-python-dotenv = "*"
-```
+See `pyproject.toml`: `numpy`, `scipy` (brentq), `requests` (CBOE feed); `pytest` for dev. Install with `pip install -e ".[dev]"`. Closed-form gamma in numpy replaces `py-vollib-vectorized`; revisit when charm and vanna land.
 
 ---
 
 ## What success looks like
 
-**End of Phase 4:** A daily JSON file is being produced with the full `GexAnalysis` object, including charm intensity and intraday wall test counts.
+**Side-by-side validation:** our pack renders cleanly on NT8 every day, with walls and pivots close to the vendor's, and AJ is comfortable switching the main charts over.
 
-**End of Phase 6:** ConfluenceAlertSystem is consuming the JSON in NT8 with a noticeable improvement in setup quality on at least one of: false-positive rate, win rate at quality-tier filters, or expectancy on bounce setups. The OutsideRedge TradingView indicator is no longer needed (subscription can be cancelled).
+**End of Phase 4:** the daily JSON includes charm intensity and intraday wall test counts.
 
-**End of Phase 7:** The methodology has been calibrated against forward-traded data and the GEX inputs are demonstrably contributing to the trading edge — measured through actual PnL attribution, not vendor-parity metrics.
+**End of Phase 6:** ConfluenceAlertSystem consumes the richer data with a noticeable improvement in setup quality on at least one of: false-positive rate, win rate at quality-tier filters, or expectancy on bounce setups.
 
-If Phase 6 doesn't show edge improvement, the project's value question gets revisited. We don't keep building this if it's not making money.
+**End of Phase 7:** GEX inputs are demonstrably contributing to the trading edge — measured through PnL attribution, not vendor-parity metrics.
+
+If the richer data doesn't show edge improvement, the project's value question gets revisited. We don't keep building this if it's not making money.
 
 ---
 
 ## Things this project is explicitly NOT
 
-- Not a GEXBot replacement focused on cost savings
+- Not a vendor replacement focused on cost savings
 - Not a research project for its own sake
 - Not a generalist GEX visualization tool
 - Not a replacement for the existing trading system — it's a richer input to it
