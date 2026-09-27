@@ -105,15 +105,23 @@ def test_build_analysis_net_walls_and_rank_sources():
         call=np.array([0.5, 7.0, 10.0, 13.0]),
         put=np.array([-4.5, -8.0, -1.0, -11.0]),
     )
-    a = build_analysis(
-        "SPX", 7743.0, datetime(2026, 9, 25, 16), profile,
-        structural_gex=lambda s: s - 7650.0, transition_gex=lambda s: s - 7710.0,
-        expected_move=43.5, cfg=GexConfig(peak_relative_threshold=0.0),
-    )
+    def analyze(cfg):
+        return build_analysis(
+            "SPX", 7743.0, datetime(2026, 9, 25, 16), profile,
+            structural_gex=lambda s: s - 7650.0, transition_gex=lambda s: s - 7710.0,
+            expected_move=43.5, cfg=cfg,
+        )
+
+    a = analyze(GexConfig(peak_relative_threshold=0.0))
     assert a.call_wall.peak.strike == 7800   # net +9
     assert a.put_wall.peak.strike == 7500    # net -4
-    assert [p.strike for p in a.support_peaks] == [8000, 7700, 7500, 7800]    # |put| ranking
-    assert [p.strike for p in a.resistance_peaks] == [7800, 8000]             # positive net ranking
+    assert [p.strike for p in a.support_peaks] == [7500, 7700]      # put-dominant only: the 8000 box is ignored
+    assert [p.strike for p in a.resistance_peaks] == [7800, 8000]   # positive net ranking
+    assert a.support_peaks[0].strike == a.put_wall.peak.strike
+    assert a.resistance_peaks[0].strike == a.call_wall.peak.strike
     assert a.zero_gamma == pytest.approx(7650.0)
     assert a.transition_level == pytest.approx(7710.0)
     assert a.regime == "Positive"
+
+    put_ranked = analyze(GexConfig(peak_relative_threshold=0.0, support_rank_source="put"))
+    assert [p.strike for p in put_ranked.support_peaks] == [8000, 7700, 7500, 7800]  # |put| ranking

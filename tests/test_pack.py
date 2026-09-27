@@ -19,7 +19,8 @@ from gex_analysis.output.pack import (
     write_pack_file,
 )
 
-VENDOR_PACK = Path(__file__).parent.parent / "validation" / "reference_packs" / "2026-09-25_vendor.txt"
+REFERENCE_PACKS = Path(__file__).parent.parent / "validation" / "reference_packs"
+VENDOR_PACK = REFERENCE_PACKS / "2026-09-25_vendor.txt"
 SYMBOLS = ("SPX", "SPY", "NDX", "QQQ", "RUT", "IWM")
 BASES = {"SPX": 62.65, "NDX": 288.49, "RUT": 22.56}
 
@@ -152,3 +153,13 @@ def test_reads_vendor_pack_and_flags_bad_ref():
     assert f.warnings == ["[REFS] unparseable line: 'QQQ 7.45.4'"]
     assert f.pack.blocks["ES"] == f.pack.blocks["MES"]
     assert derive_basis(f.pack.blocks["ES"], f.pack.blocks["SPX"]) == 63
+
+
+@pytest.mark.parametrize("day", [21, 22, 23, 25])
+def test_all_vendor_reference_packs_parse(day):
+    f = read_pack_file((REFERENCE_PACKS / f"2026-09-{day}_vendor.txt").read_text(encoding="utf-8"))
+    assert set(f.pack.blocks) == {"ES", "MES", "NQ", "MNQ", "RTY", "SPX", "SPY", "NDX", "QQQ", "IWM"}
+    assert parse_pack_date(f.pack.date_text) == date(2026, 9, day)
+    assert f.pack.blocks["ES"] == f.pack.blocks["MES"]
+    assert f.pack.blocks["NQ"] == f.pack.blocks["MNQ"]
+    assert not [w for w in f.warnings if w.startswith("[PACK]")]

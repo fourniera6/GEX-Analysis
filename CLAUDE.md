@@ -56,26 +56,38 @@ Every structural level uses dealer dollar gamma per 1% move, per strike, with de
 | CW | Call Wall | Strike with the largest **positive net** GEX | 0–365 DTE |
 | PW | Put Wall | Strike with the largest **negative net** GEX | 0–365 DTE |
 | TL | Transition Level (vol trigger) | Shift-spot zero gamma | **0–7 DTE** |
-| GD1–4 | Support-side ranks | Top 4 strikes by **put-side** \|GEX\|, strongest first | 0–365 DTE |
-| C1–4 | Resistance-side ranks | Top 4 strikes by **positive net** GEX, strongest first | 0–365 DTE |
+| GD1–4 | Support-side ranks | Top 4 strikes by **negative net** GEX (put-dominant), strongest first | 0–365 DTE |
+| C1–4 | Resistance-side ranks | Top 4 strikes by **positive net** GEX (call-dominant), strongest first | 0–365 DTE |
 | DP | Dealer Pivot (zero gamma) | Shift-spot zero gamma | 0–365 DTE |
 
-Ranks keep strikes at least 0.25% of spot apart, include levels on either side of spot (the indicator assigns Support/Resistance roles by price), and are padded with `0` when fewer than 4 qualify.
+Ranks keep strikes at least 0.25% of spot apart, include levels on either side of spot (the indicator assigns Support/Resistance roles by price), and are padded with `0` when fewer than 4 qualify. Because walls and ranks use the same net series, **PW = GD1 and CW = C1**.
 
-**Evidence (one day, 25 Sep 2026).** CBOE snapshot compared with the vendor's 25 Sep pack. The OI in both is the 24 Sep end-of-day figure, so they line up.
+**Priority (from AJ):** TL and DP are the major levels, then CW/PW. GD/C 1–4 are minor. Validation leads with TL/DP.
+
+**Evidence (one day, 25 Sep 2026; indicative only).** The vendor's 25 Sep pack was built from **24 Sep** close data (the date line is the session traded). Our CBOE snapshot was taken after the **25 Sep** close, so spot and IV are a day apart, and whether the open interest lines up is unverified. The first like-for-like check is the vendor's 28 Sep pack against our pre-market 28 Sep run.
 
 | Level | SPX vendor → ours | Across SPX, SPY, NDX, QQQ, IWM |
 |---|---|---|
 | CW / PW | 7800 / 7500 → **7800 / 7500** | 9 of 10 exact (SPY PW 750 vs 760) |
-| TL | 7710 → **7710.1** | SPY +2.0, QQQ +2.1, IWM −4.8; **NDX off by 2.5%** |
+| TL | 7710 → **7710.1** | SPY +2.0, QQQ +2.1, IWM −4.8; **NDX off by 2.6%** |
 | DP | 7659 → 7668.8 | SPY +4.5, QQQ +2.6, IWM +3.4, NDX −347 |
-| GD1–4 | 8000, 7700, 7000, 7800 → 8000, 7700, 7000, 7600 | about 13 of 20 levels found |
-| C1–4 | 7797, 7897, 7997, 7504 → 7800, 7900, 8000, 8100 | **unresolved:** at best 7 of 20 under any definition tried |
+| GD1–4 | 8000, 7700, 7000, 7800 → 7500, 7650, 7600, 7400 | differs **by design** (box-resistant; see below) |
+| C1–4 | 7797, 7897, 7997, 7504 → 7800, 7900, 8000, 8100 | underlying levels 3 of 4 on SPX (see "Vendor C levels") |
 
-- **Net walls** fix the "8000 is both walls" artifact. The 8000 strike carries huge, mostly offsetting call and put gamma (likely box or conversion trades).
+- **Net walls** fix the "8000 is both walls" artifact. The 8000 strike carries huge, mostly offsetting call and put gamma (almost certainly box or conversion trades).
+- **Box-resistant GD (AJ's choice, 27 Sep).** Ranking support by put-side |GEX| (the vendor's way) puts that 8000 box strike at GD1, i.e. "strongest support" 250 points *above* spot, even though offsetting positions carry little real hedging. Ranking by negative net keeps only put-dominant strikes. It's a logic fix, not a statistically proven one; `support_rank_source="put"` restores the vendor-style ranking.
 - **Rejected:** a cumulative-sum zero gamma (7850–7980 for SPX), side-of-spot walls (8000/7700), and a vanna sign flip for TL.
-- **Open questions:** the vendor's C levels are often not real strikes (NDX 30022, 30845), so they come from some other method. NDX and IWM pivots may need their own expiry windows.
+- **Open:** NDX (and IWM) pivots match worst. Per-symbol windows, or combined index+ETF pivots (see "Research: combined pivots"), may be the fix. Decide after the daily comparisons, not on one day.
 - Everything above is config (`structural_window_dte`, `transition_window_dte`, `support_rank_source`, `resistance_rank_source`). Revisit after 1–2 weeks of daily `compare` runs; don't retune on a single day.
+
+### Vendor C levels are index levels routed through the ETF
+
+Across the 21–25 Sep vendor packs, for all three complexes and all four consecutive day pairs, the index/futures C1–4 on day D ÷ the ETF's C1–4 on day D+1 is constant and in the same order: SPX/SPY 10.034–10.050, NDX/QQQ 41.08–41.13, RTY/IWM 10.14–10.16. Same-day ratios scatter, and no other slot shows this. The ETF values sit on index round strikes ÷ ratio: SPY 777/787/797/757 are SPX 7800/7900/8000/7600 ÷ 10.04, and IWM 283/279 are RUT 2870/2830 ÷ 10.14. SPY's own open interest wouldn't concentrate at strikes ending in 7.
+
+So the vendor computes C on the index chain and writes it into the ETF block in ETF units (rounded, a day later). The index block carries the round trip back, which is why SPX shows 7797 rather than 7800. Consequences:
+- **Our index C (positive net) already reproduces the underlying levels.** Strip the conversion and SPX C on 25 Sep is ≈ 7800/7900/8000/7500; ours is 7800/7900/8000/8100.
+- **The vendor's ETF C slots aren't the ETF's own levels,** which breaks the spec's Invariant C for those slots. On AJ's charts a `+SPY C1` confluence tag was the SPX C level confirming itself, not independent ETF information. Our ETF C are native, so our `+SPY C` tags mean something.
+- The TradingView "OutsiderEdge GEX Levels Paste Pack" page gives no methodology (it only plots pasted levels), so this came from the data alone.
 
 ---
 
@@ -88,7 +100,7 @@ The JSON emitted per symbol per run. Fields marked *(planned)* aren't implemente
 class GexAnalysis:
     # Metadata
     timestamp: datetime              # snapshot time (America/New_York)
-    underlying: str                  # "SPX", "SPY", ..., or "SPX_SPY" for the combined view
+    underlying: str                  # "SPX", "SPY", ..., or "SPX_SPY" / "NDX_QQQ" / "RUT_IWM" for combined views
     spot: float
     expected_move_1d: float          # ATM-straddle-derived, used for normalizing distances
     total_gex_per_pct: float         # dealer $ gamma per 1% move at spot, structural expiries
@@ -256,7 +268,11 @@ Implemented in `output/pack.py`:
 
 ### JSON: `output/analysis_<SYMBOL>_<session>.json`
 
-One file per symbol plus `SPX_SPY` (see "Index + ETF siblings"), containing the implemented subset of `GexAnalysis`.
+One file per symbol, plus a combined `SPX_SPY`, `NDX_QQQ` and `RUT_IWM` view (see "Research: combined pivots"), containing the implemented subset of `GexAnalysis`.
+
+### Run log: open interest freshness
+
+Each run compares every chain's total open interest with the latest earlier raw archive and prints the change. If OI is unchanged for every symbol since an **earlier day's** archive, it prints a warning: CBOE may not have published the new OI yet, so the pack would be built on stale positioning. It's a warning only; the pack is still written. The first Monday pre-market run against Friday evening's archive answers when CBOE refreshes OI.
 
 ### Future output: NT8 JSON ingestion (Phase 6)
 
@@ -280,7 +296,24 @@ An NT8 reader for the JSON (a new indicator, or an extension of `GexLevelsPasteP
 
 The pack carries each index and its ETF **separately** (Invariant C), and the indicator's ETF overlay draws the ETF's levels on the futures chart, tagging confluence (`+SPY DP`) where they land near a native level. That overlay is where the ETF's signal shows up in trading.
 
-The JSON also has a research-only `SPX_SPY` view: SPY's per-strike GEX mapped onto the SPX scale (strike × `SPX/SPY`, binned to 5 points) and added to SPX. Dollar GEX per 1% is directly additive. On 25 Sep, SPY added about 3.5% to SPX's dollar gamma and moved DP by +7 pts. It's not in the pack.
+### Research: combined pivots
+
+Dealers hedge an index complex's exposure from both chains, so the aggregate hedging flip is where **index + ETF** dollar gamma sums to zero. This combined pivot always lies between the index-only and ETF-only pivots, since the sum of two gamma curves can only cross zero between their individual crossings. So the two lines AJ already sees on a chart bracket it, but they don't show where in the bracket it sits, and the indicator's `CurrentGammaRegime` API only knows the native DP.
+
+On 25 Sep (index-scale points):
+
+| Pivot | Index-only | ETF-only | Combined | Position in the bracket |
+|---|---|---|---|---|
+| SPX DP / TL | 7669 / 7710 | 7725 / 7720 | 7676 / 7711 | 12–13% toward SPY (SPX holds ~97% of the $gamma) |
+| NDX DP / TL | 29600 / 30248 | 30245 / 30389 | 30069 / 30354 | 73–75% toward QQQ (QQQ holds 50–62%) |
+| RUT DP / TL | 2953 / 2930 | 2953 / 2870 | 2953 / 2892 | 53–63% toward IWM (IWM holds 34–55%) |
+
+For MES the difference is negligible. For NQ it's large (the combined DP is 469 points from the NDX-only DP). **There's no evidence yet that the combined pivot predicts better,** so the pack stays native and every run logs all three:
+
+- `data/pivot_log.csv`: one row per complex per run. It holds spots, ratio, basis, and TL/DP as `index_only`, `etf_only` (on the index scale) and `combined`.
+- `output/analysis_<IDX>_<ETF>_<session>.json`: the full combined analysis (the ETF profile mapped onto the index scale, binned to 5 points).
+
+**Planned test (after 4–8 weeks of logs):** for each pivot version, does being above versus below it separate the session's realized range or volatility (positive gamma should mean calmer, more mean-reverting sessions), and how often does price react at it? Use NT8 bar data. If the combined version wins on NQ/RTY, the pack's index DP/TL can switch to it for those complexes.
 
 ---
 
@@ -290,7 +323,7 @@ The JSON also has a research-only `SPX_SPY` view: SPY's per-strike GEX mapped on
 gex_analysis/
 ├── config.py                    # GexConfig methodology knobs + COMPLEXES (index, ETF, futures)
 ├── main.py                      # daily orchestrator: fetch, archive, compute, JSON + pack
-├── compare.py                   # vendor pack vs ours, slot by slot
+├── compare.py                   # vendor pack vs ours: major levels first, then the full grid
 ├── data_sources/
 │   ├── base.py                  # Chain dataclass, DataSource ABC
 │   └── cboe.py                  # CBOE delayed quotes: OCC parsing, settlement times
@@ -303,7 +336,7 @@ gex_analysis/
 │   ├── basis.py                 # front quarterly expiry, implied forward, futures basis
 │   ├── expected_move.py         # ATM straddle 1-day move
 │   ├── regime.py                # GammaRegime classification
-│   └── combine.py               # ETF GEX mapped onto the index scale (research view)
+│   └── combine.py               # ETF GEX mapped onto the index scale (combined research views)
 └── output/
     ├── analysis.py              # GexAnalysis dataclasses + JSON
     └── pack.py                  # gex_pack.txt writer + mirror reader
@@ -359,8 +392,8 @@ class GexConfig:
     risk_free_rate = 0.04
     dividend_yields = {"SPX": 0, "NDX": 0, "RUT": 0, "SPY": 0.012, "QQQ": 0.006, "IWM": 0.012}
 
-    support_rank_source = "put"               # GD1-4: "put" | "net"
-    resistance_rank_source = "net"            # C1-4: "call" | "net"
+    support_rank_source = "net"               # GD1-4: "net" (box-resistant) | "put" (vendor-style)
+    resistance_rank_source = "net"            # C1-4: "net" | "call"
     peak_relative_threshold = 0.20            # peaks must be >= 20% of the strongest in the ranking
     peak_min_separation_pct = 0.0025          # of spot
     wall_dominance_threshold = 1.5            # wall confidence reaches 1.0 at 1.5x the runner-up
@@ -371,7 +404,7 @@ class GexConfig:
     regime_battleground_normalized = 0.5      # |dist to DP| / expected move within this = Battleground
     regime_high_confidence_normalized = 2.0   # beyond this = full confidence
 
-    combined_strike_step = 5.0                # SPX_SPY research view binning
+    combined_strike_step = 5.0                # binning for the combined index+ETF research views
 
     futures_roll_days = 8                     # roll to the next quarterly expiry this many days early
     basis_strike_range_pct = 0.03             # strikes used for the implied forward
@@ -395,10 +428,11 @@ Per-strike dealer GEX, net walls, GD/C ranks, DP and TL, basic regime, JSON outp
 The spec showed the NT8 indicator already provides the integration, so the pack moved ahead of Phases 3–4. It includes all three complexes, the implied-forward basis, auto-rolled `[PRIOR]`, atomic writes and the vendor comparison tool.
 
 ### ▶ Next: side-by-side validation (1–2 weeks)
+- **Mon 28 Sep:** run pre-market (around 08:45 ET) and compare against the vendor's 28 Sep pack. That's the first like-for-like comparison. Read the open-interest lines: a change against Friday evening's archive means CBOE refreshed OI overnight.
 - Run pre-market daily (Windows Task Scheduler on the NT8 machine), writing to `gex_pack_service.txt` on a second MES chart.
-- Keep pasting the vendor pack as usual. Run `compare` daily and save the output.
-- Diff an evening vs morning snapshot to confirm when CBOE's OI refreshes.
-- Then decide on per-symbol windows (NDX, IWM), whether the C definition needs rework, and when to switch the main charts over.
+- Keep pasting the vendor pack as usual. Run `compare` daily and save the output; the major-levels section (TL/DP first) is what matters.
+- Then decide on per-symbol windows (NDX, IWM) and when to switch the main charts over.
+- Keep `data/pivot_log.csv` accumulating for the combined-pivot test (4–8 weeks).
 
 ### Phase 3: Charm and vanna
 - Add charm and vanna in `compute/greeks.py`; charm-intensity time weighting in `compute/time_of_day.py`; calibrate `charm_intensity_normalizer`
@@ -426,11 +460,13 @@ An NT8 reader for the JSON fields the pack can't carry, feeding `ConfluenceAlert
 - Black-Scholes gamma matches the closed form; zero gamma matches an analytic call/put pair; peaks, half-widths, wall confidence, regime
 - OCC parsing, AM/PM settlement, DST-correct time to expiry
 - Implied forward recovers a parity-consistent forward; quarterly expiry roll
-- Pack: 12 slots, Invariants A and B, round trip, `[PRIOR]` roll, atomic write, date parsing, **spec §4 worked example**, and a parse of the real vendor file (including its bad QQQ ref)
+- Pack: 12 slots, Invariants A and B, round trip, `[PRIOR]` roll, atomic write, date parsing, **spec §4 worked example**, and a parse of every vendor reference pack (including the bad QQQ ref)
+- Net walls and box-resistant GD on a synthetic two-sided strike; compare report; open-interest freshness; pivot log
 
 ### Layer 2: Vendor comparison (daily, `compare`)
-- Slot-by-slot differences plus GD/C rank overlap for every symbol, and each complex's basis
-- Healthy: walls mostly exact, pivots within ~0.5% of spot, GD overlap ≥ 2/4
+- **Major levels first:** TL, DP, CW, PW per cash symbol, with point and % differences, plus the median |TL| and |DP| error overall and for SPX/SPY.
+- Healthy: TL/DP for SPX/SPY within ~0.3% of the level, other symbols within ~0.5%, walls mostly exact.
+- Minor grid after that: the full 12 slots, GD/C overlap and each complex's basis. GD won't track the vendor (box-resistant by design), and ETF C overlap isn't meaningful (vendor ETF C are converted index levels).
 - Persistent large misses on one symbol mean its definition or window needs work. Small differences are expected and not a failure.
 
 ### Layer 3: Empirical edge (the real validation)
@@ -452,7 +488,9 @@ CBOE has no history, so **every run archives the raw snapshots** to `data/raw/<S
 - Intraday runs until Phase 4 needs them
 - Custom analytics like "gamma momentum" until the base profile is proven
 - SQLite-backed state
-- Exchange-holiday calendar for session dates
+- Exchange-holiday calendar for session dates, and a warning when TL/DP jump implausibly vs `[PRIOR]` (bad-snapshot guard)
+- An opt-in intraday refresh mode (re-run every N minutes so TL/DP track 0DTE decay; NT8 hot-reloads)
+- Switching pack pivots to combined index+ETF: only if the pivot-log test supports it
 
 **Rule out:**
 - Tuning knobs to chase the vendor's exact numbers
@@ -463,13 +501,17 @@ CBOE has no history, so **every run archives the raw snapshots** to `data/raw/<S
 ## Open questions for AJ
 
 1. **Where does the service run?** It has to write where NT8 reads (`Documents\NinjaTrader 8\`), so most likely the NT8 Windows machine via Task Scheduler, pre-market.
-2. **Vendor pack dating.** Is the pack labelled "25 september 2026" the one you traded *on* the 25th? We assume yes: the date line is the target session.
-3. **Chain expiry universe.** Does 0DTE-driven behaviour feel dominant, or do longer-dated levels feel structural? This bears on TL/DP windows, alongside the daily comparisons.
-4. **C levels.** Do you trade the C1–4 levels much? The vendor's aren't reproducible yet. If they matter, send a few more days of vendor packs.
-5. **Backtest data.** Any historical option chain data (or budget for it)? Otherwise Layer 3 runs forward on our own archive.
-6. **Existing TradingAgents tooling.** Any options adapters in the TauricResearch repo worth reusing?
+2. **Chain expiry universe.** Does 0DTE-driven behaviour feel dominant, or do longer-dated levels feel structural? This bears on TL/DP windows, alongside the daily comparisons.
+3. **Backtest data.** Any historical option chain data (or budget for it)? Otherwise Layer 3 runs forward on our own archive.
+4. **Existing TradingAgents tooling.** Any options adapters in the TauricResearch repo worth reusing?
 
-Answered: data source (CBOE delayed JSON), latency (daily, pre-market), output destination (`gex_pack.txt` for `GexLevelsPastePack.cs`).
+Answered:
+- Data source: CBOE delayed JSON.
+- Latency: daily, pre-market.
+- Output destination: `gex_pack.txt` for `GexLevelsPastePack.cs`.
+- Pack dating: the date line is the session traded; the 25 Sep and 24 Sep packs were both used on the 25th.
+- Level priority: TL and DP are major; GD/C 1–4 are minor.
+- C levels: resolved from the data (see "Vendor C levels").
 
 ---
 
@@ -481,7 +523,8 @@ Answered: data source (CBOE delayed JSON), latency (daily, pre-market), output d
 - `RegimeClassifierV1.cs` (NinjaTrader project) — the price-action regime classifier we stack with gamma regime for the 2x2.
 - `LevelTracker.cs` (NinjaTrader project) — dynamic intraday levels; GEX levels complement these.
 - `validation/reference_packs/2026-09-25_vendor.txt` — AJ's live pack with the vendor's 25 Sep (`[PACK]`) and 24 Sep (`[PRIOR]`) levels, kept verbatim, including the `QQQ 7.45.4` ref typo.
-- OutsideRedge "GEX Levels" docs (https://outsideredge.com/docs/gamma-exposure-levels) — the TradingView product the pack format originated from; historical context only.
+- `validation/reference_packs/2026-09-2{1,2,3}_vendor.txt` — the vendor's 21–23 Sep packs (`[PACK]` only, blocks verbatim).
+- OutsideRedge "GEX Levels" docs (https://outsideredge.com/docs/gamma-exposure-levels) and the TradingView "OutsiderEdge GEX Levels Paste Pack" script page — the display product the pack format came from. Neither gives any methodology; historical context only.
 
 ---
 

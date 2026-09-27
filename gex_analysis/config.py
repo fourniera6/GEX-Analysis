@@ -35,8 +35,9 @@ class GexConfig:
         "SPX": 0.0, "NDX": 0.0, "RUT": 0.0, "SPY": 0.012, "QQQ": 0.006, "IWM": 0.012,
     })
 
-    # Which per-strike series ranks the support (GD1-4) and resistance (C1-4) levels.
-    support_rank_source: Literal["put", "net"] = "put"
+    # Which per-strike series ranks the support (GD1-4) and resistance (C1-4) levels. "net" ignores strikes
+    # whose call and put gamma offset (box/conversion trades), which "put" would rank as strong support.
+    support_rank_source: Literal["put", "net"] = "net"
     resistance_rank_source: Literal["call", "net"] = "net"
     peak_relative_threshold: float = 0.20
     peak_min_separation_pct: float = 0.0025
