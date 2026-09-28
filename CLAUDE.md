@@ -77,7 +77,14 @@ Ranks keep strikes at least 0.25% of spot apart, include levels on either side o
 - **Net walls** fix the "8000 is both walls" artifact. The 8000 strike carries huge, mostly offsetting call and put gamma (almost certainly box or conversion trades).
 - **Box-resistant GD (AJ's choice, 27 Sep).** Ranking support by put-side |GEX| (the vendor's way) puts that 8000 box strike at GD1, i.e. "strongest support" 250 points *above* spot, even though offsetting positions carry little real hedging. Ranking by negative net keeps only put-dominant strikes. It's a logic fix, not a statistically proven one; `support_rank_source="put"` restores the vendor-style ranking.
 - **Rejected:** a cumulative-sum zero gamma (7850–7980 for SPX), side-of-spot walls (8000/7700), and a vanna sign flip for TL.
-- **Open:** NDX (and IWM) pivots match worst. Per-symbol windows, or combined index+ETF pivots (see "Research: combined pivots"), may be the fix. Decide after the daily comparisons, not on one day.
+**First like-for-like check (28 Sep, pre-market run after the stale-spot fix):**
+- Median |TL| / |DP| error for SPX/SPY: 0.18% / 0.21% (all five symbols: 0.20% / 0.27%).
+- CW/PW exact everywhere except SPX CW 7900 vs the vendor's 7800. Our wall confidence there was 0.06, a near tie, so treat 7800–7900 as the resistance zone.
+- SPX C set matches 4/4 (only the order differs). ES basis: 61.72 vs the vendor's 61.
+
+**Reading wall confidence:** near 0 means the runner-up strike carries almost the same net gamma. Treat the two as a zone rather than trusting which one ranked first.
+
+- **NDX (open, watching per AJ):** both packs put NDX CW/PW at 29475/29500, about 1,100 points below spot, with the call wall under the put wall. It's not a box but a single deep-ITM line: 3,493 Oct-16 NDX 29475 calls against 18 puts, in a thin chain (total NDX OI about 185k vs SPX's 22M). Wider expiry windows pull the NDX pivot toward that cluster (0–30 DTE: 30,025 vs our 0–7 DTE TL of 30,422), which likely explains the vendor's NDX TL of 29,450. So the vendor's NQ walls and TL are probably artifacts too. Candidate fixes are deferred until NQ matters more: an OTM-only variant for thin chains, or combined NDX+QQQ levels via the pivot-log test (QQQ holds 50–62% of the complex's gamma).
 - Everything above is config (`structural_window_dte`, `transition_window_dte`, `support_rank_source`, `resistance_rank_source`). Revisit after 1–2 weeks of daily `compare` runs; don't retune on a single day.
 
 ### Vendor C levels are index levels routed through the ETF
