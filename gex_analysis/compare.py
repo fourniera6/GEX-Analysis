@@ -106,6 +106,24 @@ def level_changes(old: PackSection | None, new: PackSection) -> list[str]:
     return lines or ["no level changes"]
 
 
+def drift_report(base: PackSection, new: PackSection) -> list[str]:
+    """Major levels (TL, DP, CW, PW) per cash symbol that differ from the pre-market pack, with signed deltas."""
+    if base is new:
+        return []
+    lines = []
+    for sym in CASH_SYMBOLS:
+        before, after = base.blocks.get(sym), new.blocks.get(sym)
+        if before is None or after is None:
+            continue
+        moved = [
+            f"{name} {_fmt(after[i])} (pre {_fmt(before[i])}, {after[i] - before[i]:+.1f})"
+            for name, i in MAJORS if round(after[i], 2) != round(before[i], 2) and before[i] and after[i]
+        ]
+        if moved:
+            lines.append(f"{sym:<4} " + "  ".join(moved))
+    return lines
+
+
 def compare_sections(vendor: PackSection, ours: PackSection) -> str:
     return major_levels(vendor, ours) + "\n\n" + minor_levels(vendor, ours)
 

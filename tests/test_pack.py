@@ -163,3 +163,13 @@ def test_all_vendor_reference_packs_parse(day):
     assert f.pack.blocks["ES"] == f.pack.blocks["MES"]
     assert f.pack.blocks["NQ"] == f.pack.blocks["MNQ"]
     assert not [w for w in f.warnings if w.startswith("[PACK]")]
+
+
+def test_premarket_section_round_trips_without_disturbing_pack_and_prior():
+    pack, prior, pre = _section(date(2026, 9, 28)), _section(date(2026, 9, 25)), _section(date(2026, 9, 28))
+    pre.blocks["SPX"] = [x - 1 if x else 0.0 for x in pre.blocks["SPX"]]
+    parsed = read_pack_file(format_pack_file({"SPY": 771.35}, pack, prior, ["h"], pre))
+    assert parsed.warnings == []
+    assert parsed.pack.date_text == "28 SEP 2026" and parsed.prior.date_text == "25 SEP 2026"
+    assert parsed.premarket.blocks["SPX"] == pytest.approx(pre.blocks["SPX"])
+    assert parsed.pack.blocks["SPX"] == pytest.approx(pack.blocks["SPX"])

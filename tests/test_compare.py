@@ -59,3 +59,14 @@ def test_level_changes():
     assert level_changes(None, new) == ["first pack for session 28 SEP 2026"]
     assert level_changes(PackSection("25 SEP 2026", old.blocks), new) == ["first pack for session 28 SEP 2026"]
     assert level_changes(new, new) == ["no level changes"]
+
+
+def test_drift_report():
+    from gex_analysis.compare import drift_report
+
+    pre = PackSection("28 SEP 2026", {"SPX": _block(7900, 7500, 7702.7, 7661.1), "SPY": _block(785, 750, 769.4, 770.2)})
+    now = PackSection("28 SEP 2026", {"SPX": _block(7800, 7500, 7710.0, 7683.7), "SPY": _block(785, 750, 769.4, 0)})
+    assert drift_report(pre, now) == [
+        "SPX  TL 7710 (pre 7702.70, +7.3)  DP 7683.70 (pre 7661.10, +22.6)  CW 7800 (pre 7900, -100.0)"
+    ]
+    assert drift_report(pre, pre) == []

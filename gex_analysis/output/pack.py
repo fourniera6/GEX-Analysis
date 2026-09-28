@@ -30,6 +30,7 @@ class PackFile:
     refs: dict[str, float] = field(default_factory=dict)
     pack: PackSection | None = None
     prior: PackSection | None = None
+    premarket: PackSection | None = None  # service extension; the indicator ignores unknown sections
     warnings: list[str] = field(default_factory=list)
 
 
@@ -93,24 +94,36 @@ def _format_section(name: str, section: PackSection) -> list[str]:
 
 
 def format_pack_file(
-    refs: dict[str, float], pack: PackSection, prior: PackSection | None, header_lines: list[str] = ()
+    refs: dict[str, float],
+    pack: PackSection,
+    prior: PackSection | None,
+    header_lines: list[str] = (),
+    premarket: PackSection | None = None,
 ) -> str:
     lines = [f"# {h}" for h in header_lines]
     lines += ["[REFS]", *(f"{sym} {format_number(p)}" for sym, p in refs.items()), ""]
     lines += _format_section("PACK", pack)
     if prior is not None:
         lines += _format_section("PRIOR", prior)
+    if premarket is not None:
+        lines += _format_section("PREMARKET", premarket)
     return "\n".join(lines)
 
 
-def write_pack_file(path: Path, refs: dict[str, float], pack: PackSection, header_lines: list[str] = ()) -> None:
+def write_pack_file(
+    path: Path,
+    refs: dict[str, float],
+    pack: PackSection,
+    header_lines: list[str] = (),
+    premarket: PackSection | None = None,
+) -> None:
     """Atomic write. The existing [PACK] rolls into [PRIOR] when the session date changes."""
     prior = None
     if path.exists():
         existing = read_pack_file(path.read_text(encoding="utf-8"))
         prior = existing.pack if existing.pack and not same_session(existing.pack, pack) else existing.prior
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(format_pack_file(refs, pack, prior, header_lines), encoding="utf-8")
+    tmp.write_text(format_pack_file(refs, pack, prior, header_lines, premarket), encoding="utf-8")
     _replace(tmp, path)
 
 
@@ -153,7 +166,7 @@ def read_pack_file(text: str) -> PackFile:
             result.refs[parts[0].upper()] = float(parts[1])
         except (IndexError, ValueError):
             result.warnings.append(f"[REFS] unparseable line: {line!r}")
-    for name in ("PACK", "PRIOR"):
+    for name in ("PACK", "PRIOR", "PREMARKET"):
         if name in sections:
             section, warnings = parse_pack_string(" ".join(sections[name]))
             setattr(result, name.lower(), section)

@@ -66,9 +66,9 @@ SPOTS = {"SPX": 7700.0, "SPY": 767.0, "NDX": 30600.0, "QQQ": 745.0, "RUT": 2830.
 ROOTS = {"SPX": ("SPXW", "SPX"), "NDX": ("NDXP", "NDX"), "RUT": ("RUTW", "RUT")}
 
 
-def _synthetic_payload(symbol: str) -> bytes:
+def _synthetic_payload(symbol: str, shift: float = 0.0) -> bytes:
     """A small parity-consistent chain: a near (Mon) and a Dec expiry, 11 strikes around spot."""
-    spot, asof = SPOTS[symbol], datetime(2026, 9, 25, 16, 0, tzinfo=ET)
+    spot, asof = SPOTS[symbol] * (1 + shift), datetime(2026, 9, 25, 16, 0, tzinfo=ET)
     near_root, far_root = ROOTS.get(symbol, (symbol, symbol))
     far_settle = time(9, 30) if far_root in ("SPX", "NDX", "RUT") else time(16, 0)
     options = []
@@ -90,8 +90,11 @@ def _synthetic_payload(symbol: str) -> bytes:
 
 
 class FakeSource(DataSource):
+    def __init__(self, shift: float = 0.0):
+        self.shift = shift  # move every spot by this fraction, e.g. an intraday selloff
+
     def fetch_chain(self, underlying):
-        return parse_payload(underlying, _synthetic_payload(underlying))
+        return parse_payload(underlying, _synthetic_payload(underlying, self.shift))
 
 
 def test_run_without_archive_still_writes_pack_history_and_log(tmp_path):
@@ -110,6 +113,30 @@ def test_run_without_archive_still_writes_pack_history_and_log(tmp_path):
     second = run(archive=True, **kwargs)
     assert len(list(raw.iterdir())) == 6
     assert second.changes == ["no level changes"]
+
+
+def test_premarket_is_set_before_the_open_and_kept_through_the_session(tmp_path):
+    from gex_analysis.output.pack import read_pack_file
+
+    kwargs = dict(out_dir=tmp_path / "output", raw_dir=tmp_path / "data" / "raw",
+                  pivot_log=tmp_path / "data" / "pivot_log.csv", archive=False)
+    morning = run(source=FakeSource(), now=datetime(2026, 9, 28, 8, 45, tzinfo=ET), **kwargs)
+    pre = read_pack_file(morning.pack_path.read_text())
+    assert pre.premarket.blocks == pre.pack.blocks and morning.drift == []
+
+    midday = run(source=FakeSource(shift=-0.01), now=datetime(2026, 9, 28, 11, 45, tzinfo=ET),
+                 hold_levels=True, **kwargs)
+    after = read_pack_file(midday.pack_path.read_text())
+    assert after.premarket.blocks == pre.pack.blocks            # kept from the morning
+    assert after.pack.blocks != pre.pack.blocks                 # while the live levels moved
+    assert midday.history_path.name == "2026-09-28_1145.txt"
+
+    assert after.pack.blocks["SPY"][0] == pre.pack.blocks["SPY"][0]  # CW held: the shifted data alone picks 775
+
+    rerun = run(source=FakeSource(shift=-0.01), now=datetime(2026, 9, 28, 9, 10, tzinfo=ET), **kwargs)
+    reread = read_pack_file(rerun.pack_path.read_text())
+    assert reread.premarket.blocks == reread.pack.blocks != pre.pack.blocks  # a pre-open rerun resets it
+    assert reread.pack.blocks["SPY"][0] == 775.0                              # and isn't held
 
 
 def test_intraday_slots():
@@ -135,9 +162,9 @@ def test_run_intraday_archives_hourly_survives_errors_and_skips_missed_slots(mon
 
     calls = []
 
-    def run_once(archive):
+    def run_once(archive, hold_levels):
         now = clock["now"]
-        calls.append((f"{now:%H:%M}", archive))
+        calls.append((f"{now:%H:%M}", archive, hold_levels))
         if f"{now:%H:%M}" == "11:15":
             raise requests.ConnectionError("CBOE unreachable")
         if f"{now:%H:%M}" == "12:15":
@@ -150,7 +177,7 @@ def test_run_intraday_archives_hourly_survives_errors_and_skips_missed_slots(mon
     monkeypatch.setattr(main, "print_changes", lambda result: None)
     run_intraday(run_once, GexConfig())
 
-    assert calls == [
+    assert [(t, archive) for t, archive, _ in calls] == [
         ("08:45", True),
         ("09:45", True), ("10:15", True), ("10:45", False),
         ("11:15", True),            # failed, so the hour wasn't archived...
@@ -158,3 +185,4 @@ def test_run_intraday_archives_hourly_survives_errors_and_skips_missed_slots(mon
         ("12:15", True),            # 12:45-13:45 are skipped: missed while asleep until 14:15
         ("14:15", True), ("14:45", False), ("15:15", True), ("15:45", False),
     ]
+    assert [hold for _, _, hold in calls] == [False] + [True] * (len(calls) - 1)  # fresh first, then held

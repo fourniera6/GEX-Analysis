@@ -125,3 +125,50 @@ def test_build_analysis_net_walls_and_rank_sources():
 
     put_ranked = analyze(GexConfig(peak_relative_threshold=0.0, support_rank_source="put"))
     assert [p.strike for p in put_ranked.support_peaks] == [8000, 7700, 7500, 7800]  # |put| ranking
+
+
+def test_sticky_peaks():
+    from gex_analysis.compute.peaks import sticky_peaks
+
+    strikes = np.array([7400.0, 7500.0, 7550.0, 7600.0])
+
+    def rank(magnitude, incumbents, separation=40.0):
+        ranked = find_peaks(strikes, magnitude, 0.2, separation)
+        return [float(strikes[i]) for i in sticky_peaks(strikes, magnitude, ranked, incumbents, 0.2, 0.2, separation)]
+
+    mags = np.array([3.0, 10.0, 0.0, 11.0])
+    assert rank(mags, []) == [7600, 7500, 7400]
+    assert rank(mags, [7500]) == [7500, 7600, 7400]              # 11 <= 10 * 1.2: held
+    assert rank(np.array([3.0, 10.0, 0.0, 13.0]), [7500]) == [7600, 7500, 7400]  # 13 > 12: replaced
+    assert rank(mags, [7500, 7600]) == [7500, 7600, 7400]        # a near-tie pair keeps its order
+    assert rank(mags, [9999]) == [7600, 7500, 7400]              # vanished incumbent gives way
+    assert rank(np.array([1.0, 10.0, 0.0, 11.0]), [7400]) == [7600, 7500]  # below the 20% threshold: dropped
+    near = np.array([3.0, 10.0, 9.5, 11.0])
+    assert rank(near, [7500, 7550], separation=60.0) == [7500, 7600, 7400]  # 7550 too close to held 7500
+
+
+def test_build_analysis_holds_near_tie_walls_only():
+    from datetime import datetime
+
+    from gex_analysis.main import build_analysis
+
+    def analyze(put_7600, incumbent=None):
+        profile = StrikeProfile(
+            strikes=np.array([7500.0, 7600.0, 7800.0]),
+            call=np.array([0.0, 0.0, 5.0]),
+            put=np.array([-10.0, put_7600, 0.0]),
+        )
+        return build_analysis(
+            "SPX", 7680.0, datetime(2026, 9, 28, 11), profile,
+            structural_gex=lambda s: s - 7684.0, transition_gex=lambda s: s - 7710.0,
+            expected_move=38.4, cfg=GexConfig(peak_relative_threshold=0.0), incumbent=incumbent,
+        )
+
+    held = [7800, 7500, 7703, 7500, 0, 0, 0, 7800, 0, 0, 0, 7661]  # this morning's pack: PW 7500
+    assert analyze(-11.0).put_wall.peak.strike == 7600               # fresh: 7600 is (slightly) stronger
+    tie = analyze(-11.0, held)
+    assert tie.put_wall.peak.strike == 7500 and tie.put_wall.confidence == 0.0
+    assert [p.strike for p in tie.support_peaks] == [7500, 7600]
+    assert analyze(-13.0, held).put_wall.peak.strike == 7600          # >20% stronger: it moves
+    assert tie.zero_gamma == pytest.approx(7684.0)                     # pivots are never held
+    assert tie.transition_level == pytest.approx(7710.0)

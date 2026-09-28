@@ -61,3 +61,5 @@ class GexConfig:
     intraday_start: time = time(9, 45)
     intraday_end: time = time(15, 45)
     intraday_every_minutes: int = 30
+    # On intraday slot runs, a wall/rank keeps its strike unless a new one is more than this much stronger.
+    intraday_level_hysteresis: float = 0.20

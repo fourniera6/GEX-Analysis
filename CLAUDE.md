@@ -267,6 +267,7 @@ Implemented in `output/pack.py`:
 - **Invariant A:** MES ≡ ES and MNQ ≡ NQ, byte-identical.
 - **Invariant B:** each futures block is its index block plus one basis at every slot. The basis is the index options' put-call-parity implied forward at the front quarterly futures expiry (rolled 8 days early), minus the spot implied by the same quotes (see "Pricing spot" under "Data source"). ES–SPX: 62.65 on 25 Sep vs the vendor's 63, and 61.82 on 28 Sep pre-market vs the vendor's 61.
 - **Invariant C:** ETF blocks are the ETF chain's own levels. The indicator converts them.
+- **`[PREMARKET]` (service extension):** the session's levels as of the open, in the same block format as `[PACK]` (futures included). Any run before 09:30 ET sets it, intraday updates keep it, and the next session replaces it. The current indicator ignores unknown sections, so it's safe today. To draw it, `GexLevelsPastePack.cs` can reuse the `[PRIOR]` path (`BuildPriorDayLevels`) with a "PM" label: dotted ghost line when a current level has drifted more than 8 ticks away, a "• PM" tag when it hasn't.
 - **The `RUT` block is included,** which gives RTY charts full IWM overlay support (spec §3 gotcha).
 - **Refs:** ETF ref = the ETF's official close; futures ref = the index's official close + basis. So `ratio = (futures_ref − basis) / etf_ref = index close / ETF close`, a simultaneous pair even pre-market, when ETFs trade and indexes don't. The ratio drifts only slowly, so a prior-day close pair is accurate to well under a point.
 - **Written atomically** (temp file + `os.replace`, retried briefly if NT8 is mid-read on Windows).
@@ -297,6 +298,12 @@ Runs once immediately (the pre-market run when launched around 08:45), then ever
   - Walls and ranks re-weight toward spot (PW 7500→7600, CW 7900→7800), and near-ties flip back and forth.
   - DP moves (+23) can flip `CurrentGammaRegime` (Positive → Battleground) while price sits still.
 - **Daily vendor comparison:** use the pre-market copy in `data/packs/`, since the live pack keeps changing. The pivot log gets a row per run, which is the raw material for studying intraday DP/TL drift.
+- **Hysteresis (AJ's choice, 28 Sep):**
+  - On the 30-minute updates, each wall and rank slot keeps its current strike unless a new one is more than `intraday_level_hysteresis` (20%) stronger. It's implemented in `compute/peaks.py: sticky_peaks`, with the incumbents being this session's current `[PACK]`.
+  - The first run of the loop and plain runs are always fresh, so new OI is never held back. TL/DP are never held.
+  - A held wall's confidence reads 0, since it's a tie by construction.
+  - Replaying 28 Sep: SPX PW held 7500 all day (fresh flipped to 7600), SPY PW held 750 (fresh 761), and QQQ's 730/738 flicker disappeared. SPX CW still moved 7900→7800 because 7800 overtook it decisively (confidence 0.49).
+- **Pre-market reference:** every update prints the major levels that differ from `[PREMARKET]`, e.g. `SPX  TL 7710 (pre 7702.70, +7.3)  DP 7683.70 (pre 7661.10, +22.6)`. On 28 Sep the pre-market DP (7661) sat 5.6 points under the day's low while the intraday DP (7684–7687) was where price chopped. Both mattered, which is why the pre-market levels are kept.
 
 ### Future output: NT8 JSON ingestion (Phase 6)
 
@@ -431,6 +438,10 @@ class GexConfig:
 
     combined_strike_step = 5.0                # binning for the combined index+ETF research views
 
+    intraday_start, intraday_end = 09:45, 15:45   # --intraday schedule (ET)
+    intraday_every_minutes = 30
+    intraday_level_hysteresis = 0.20          # walls/ranks hold unless beaten by more than this on intraday updates
+
     futures_roll_days = 8                     # roll to the next quarterly expiry this many days early
     basis_strike_range_pct = 0.03             # strikes used for the implied forward
 ```
@@ -487,7 +498,8 @@ An NT8 reader for the JSON fields the pack can't carry, feeding `ConfluenceAlert
 - Implied forward recovers a parity-consistent forward; quarterly expiry roll
 - Pack: 12 slots, Invariants A and B, round trip, `[PRIOR]` roll, atomic write, date parsing, **spec §4 worked example**, and a parse of every vendor reference pack (including the bad QQQ ref)
 - Net walls and box-resistant GD on a synthetic two-sided strike; compare report; open-interest freshness; pivot log
-- Intraday: slot schedule, change report, a no-archive run end to end on a synthetic data source, and the loop's hourly archiving, error survival and missed-slot skipping under a fake clock
+- Intraday: slot schedule, change report, a no-archive run end to end on a synthetic data source, and the loop's hourly archiving, error survival, missed-slot skipping and fresh-then-held runs under a fake clock
+- Hysteresis (`sticky_peaks`, held walls in `build_analysis`), `[PREMARKET]` round trip and its set/keep/reset rules, drift report
 
 ### Layer 2: Vendor comparison (daily, `compare`)
 - **Major levels first:** TL, DP, CW, PW per cash symbol, with point and % differences, plus the median |TL| and |DP| error overall and for SPX/SPY.
@@ -515,7 +527,8 @@ CBOE has no history, so **every run archives the raw snapshots** to `data/raw/<S
 - Custom analytics like "gamma momentum" until the base profile is proven
 - SQLite-backed state
 - Exchange-holiday calendar for session dates, and a warning when TL/DP jump implausibly vs `[PRIOR]` (bad-snapshot guard)
-- Intraday stability options, if flicker bothers AJ in practice: freezing walls/ranks at pre-market values, or hysteresis on near-ties
+- Freezing walls/ranks at pre-market values all day (stronger than the 20% hysteresis), if flicker still bothers AJ in practice
+- NT8 rendering of `[PREMARKET]` in `GexLevelsPastePack.cs` (AJ's side; see the pack contract)
 - Switching pack pivots to combined index+ETF: only if the pivot-log test supports it
 
 **Rule out:**
