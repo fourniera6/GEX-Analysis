@@ -47,3 +47,15 @@ def test_minor_levels_rank_overlap():
     spy_diff = rows[rows.index(next(r for r in rows if r.startswith("SPY "))) + 2]
     assert spy_diff.endswith("C n/a")
     assert "QQQ      not in our pack" in text
+
+
+def test_level_changes():
+    from gex_analysis.compare import level_changes
+
+    old = PackSection("28 SEP 2026", {"SPX": _block(7900, 7500, 7702.66, 7661.1), "SPY": _block(785, 750, 769.4, 770.2)})
+    new = PackSection("28 SEP 2026", {"SPX": _block(7800, 7600, 7702.661, 7683.7), "SPY": _block(785, 750, 769.4, 770.2),
+                                      "NDX": _block(29475, 29500, 30421.5, 30001.7)})
+    assert level_changes(old, new) == ["SPX  CW 7900→7800  PW 7500→7600  DP 7661.10→7683.70"]
+    assert level_changes(None, new) == ["first pack for session 28 SEP 2026"]
+    assert level_changes(PackSection("25 SEP 2026", old.blocks), new) == ["first pack for session 28 SEP 2026"]
+    assert level_changes(new, new) == ["no level changes"]

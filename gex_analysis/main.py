@@ -3,11 +3,14 @@ import csv
 import gzip
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import sleep
 
 import numpy as np
+import requests
 
+from .compare import level_changes
 from .compute.basis import underlying_level
 from .compute.combine import combine_profiles
 from .compute.expected_move import expected_move_1d
@@ -20,7 +23,7 @@ from .config import COMPLEXES, Complex, GexConfig
 from .data_sources.base import Chain, DataSource
 from .data_sources.cboe import ET, CboeDelayedSource, parse_payload
 from .output.analysis import GammaPeak, GexAnalysis, WallInfo
-from .output.pack import build_pack, build_refs, pack_levels, write_pack_file
+from .output.pack import build_pack, build_refs, pack_levels, read_pack_file, write_pack_file
 
 MARKET_CLOSE = time(16, 0)
 PIVOT_LOG_FIELDS = [
@@ -176,6 +179,8 @@ class RunResult:
     pivot_rows: list[dict]
     open_interest_lines: list[str]
     stale_open_interest: list[str]
+    changes: list[str]
+    history_path: Path
 
 
 def run(
@@ -185,7 +190,9 @@ def run(
     raw_dir: Path = Path("data/raw"),
     pack_path: Path | None = None,
     pivot_log: Path = Path("data/pivot_log.csv"),
+    archive: bool = True,
 ) -> RunResult:
+    """One full computation. Every pack written is also kept in <raw_dir>/../packs/<session>_<HHMM>.txt."""
     cfg = cfg or GexConfig()
     source = source or CboeDelayedSource()
     fetched = datetime.now(ET)
@@ -200,8 +207,9 @@ def run(
         {s: previous_open_interest(s, raw_dir) for s in chains},
         fetched.date(),
     )
-    for sym, chain in chains.items():
-        (raw_dir / f"{sym}_{fetched:%Y-%m-%d_%H%M}.json.gz").write_bytes(gzip.compress(chain.raw))
+    if archive:
+        for sym, chain in chains.items():
+            (raw_dir / f"{sym}_{fetched:%Y-%m-%d_%H%M}.json.gz").write_bytes(gzip.compress(chain.raw))
 
     # Price everything at the level implied by each chain's own option quotes: outside regular hours the quoted
     # index level is stale while SPX options still trade, and ETF quotes move pre-market while their options don't.
@@ -241,10 +249,12 @@ def run(
         (out_dir / f"analysis_{a.underlying}_{session}.json").write_text(a.to_json())
 
     pack_path = pack_path or out_dir / "gex_pack.txt"
+    pack = build_pack({s: pack_levels(a) for s, a in analyses.items()}, bases, session)
+    previous = read_pack_file(pack_path.read_text(encoding="utf-8")).pack if pack_path.exists() else None
     write_pack_file(
         pack_path,
         build_refs({s: ch.close for s, ch in chains.items()}, bases),
-        build_pack({s: pack_levels(a) for s, a in analyses.items()}, bases, session),
+        pack,
         [
             f"Generated {fetched:%Y-%m-%d %H:%M} ET by gex-analysis from CBOE delayed quotes "
             f"(SPX data as of {chains['SPX'].asof:%Y-%m-%d %H:%M} ET).",
@@ -253,7 +263,25 @@ def run(
             "so each pair is simultaneous even when run outside regular hours.",
         ],
     )
-    return RunResult({**analyses, **combined}, bases, session, pack_path, pivot_rows, oi_lines, stale_oi)
+    history_path = raw_dir.parent / "packs" / f"{session}_{fetched:%H%M}.txt"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(pack_path.read_text(encoding="utf-8"), encoding="utf-8")
+    return RunResult(
+        {**analyses, **combined}, bases, session, pack_path, pivot_rows, oi_lines, stale_oi,
+        level_changes(previous, pack), history_path,
+    )
+
+
+def intraday_slots(now: datetime, start: time, end: time, every_minutes: int) -> list[datetime]:
+    """Scheduled run times still ahead of `now` today: start, start + every, ... up to end (ET)."""
+    slot = datetime.combine(now.date(), start, ET)
+    last = datetime.combine(now.date(), end, ET)
+    slots = []
+    while slot <= last:
+        if slot > now:
+            slots.append(slot)
+        slot += timedelta(minutes=every_minutes)
+    return slots
 
 
 def summarize(a: GexAnalysis) -> str:
@@ -272,15 +300,14 @@ def summarize(a: GexAnalysis) -> str:
     ])
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Compute GEX levels and write gex_pack.txt.")
-    parser.add_argument("--pack-path", type=Path, help="where to write the pack (default: output/gex_pack.txt)")
-    parser.add_argument("--out-dir", type=Path, default=Path("output"))
-    parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
-    parser.add_argument("--pivot-log", type=Path, default=Path("data/pivot_log.csv"))
-    args = parser.parse_args()
+def print_changes(result: RunResult) -> None:
+    print("\nChanges since the previous pack")
+    for line in result.changes:
+        print(f"  {line}")
+    print(f"\nPack for session {result.session} written to {result.pack_path} (copy: {result.history_path})")
 
-    result = run(out_dir=args.out_dir, raw_dir=args.raw_dir, pack_path=args.pack_path, pivot_log=args.pivot_log)
+
+def print_summary(result: RunResult) -> None:
     for c in COMPLEXES:
         print(summarize(result.analyses[c.index]))
         print(summarize(result.analyses[c.etf]))
@@ -302,7 +329,68 @@ def main() -> None:
               "may be built on stale positioning. Consider re-running later.")
 
     bases = "  ".join(f"{c.futures[0]}-{c.index} {result.bases[c.index]:+.2f}" for c in COMPLEXES)
-    print(f"\nBasis: {bases}\nPack for session {result.session} written to {result.pack_path}")
+    print(f"\nBasis: {bases}")
+    print_changes(result)
+
+
+def run_intraday(run_once: Callable[[bool], RunResult], cfg: GexConfig) -> None:
+    """Run now, then at each remaining slot today. Raw snapshots are archived at most once per clock hour."""
+    last_archived_hour = None
+
+    def attempt(archive: bool) -> RunResult | None:
+        try:
+            return run_once(archive)
+        except (requests.RequestException, ValueError) as err:
+            print(f"\n{datetime.now(ET):%H:%M} ET update failed, keeping the previous pack: {err}")
+            return None
+
+    start = datetime.now(ET)
+    result = attempt(archive=True)
+    if result is not None:
+        print_summary(result)
+        last_archived_hour = start.replace(minute=0, second=0, microsecond=0)
+
+    for slot in intraday_slots(start, cfg.intraday_start, cfg.intraday_end, cfg.intraday_every_minutes):
+        wait = (slot - datetime.now(ET)).total_seconds()
+        if wait < -300:  # missed while the machine slept: skip rather than replay a burst
+            continue
+        print(f"\nNext update at {slot:%H:%M} ET (Ctrl-C to stop)")
+        sleep(max(wait, 0))
+        hour = slot.replace(minute=0)
+        archive = hour != last_archived_hour
+        result = attempt(archive)
+        if result is None:
+            continue
+        if archive:
+            last_archived_hour = hour
+        print(f"\n=== {datetime.now(ET):%H:%M} ET update ({'archived' if archive else 'not archived'}) ===")
+        print_changes(result)
+    print("\nIntraday updates finished for the day.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compute GEX levels and write gex_pack.txt.")
+    parser.add_argument("--pack-path", type=Path, help="where to write the pack (default: output/gex_pack.txt)")
+    parser.add_argument("--out-dir", type=Path, default=Path("output"))
+    parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
+    parser.add_argument("--pivot-log", type=Path, default=Path("data/pivot_log.csv"))
+    parser.add_argument("--intraday", action="store_true",
+                        help="run now, then every 30 min from 09:45 to 15:45 ET, recomputing all levels")
+    args = parser.parse_args()
+
+    cfg = GexConfig()
+
+    def run_once(archive: bool) -> RunResult:
+        return run(cfg=cfg, out_dir=args.out_dir, raw_dir=args.raw_dir, pack_path=args.pack_path,
+                   pivot_log=args.pivot_log, archive=archive)
+
+    if not args.intraday:
+        print_summary(run_once(archive=True))
+        return
+    try:
+        run_intraday(run_once, cfg)
+    except KeyboardInterrupt:
+        print("\nStopped. The last pack written stays in place.")
 
 
 if __name__ == "__main__":

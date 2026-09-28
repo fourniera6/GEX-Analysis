@@ -108,13 +108,13 @@ def write_pack_file(path: Path, refs: dict[str, float], pack: PackSection, heade
     prior = None
     if path.exists():
         existing = read_pack_file(path.read_text(encoding="utf-8"))
-        prior = existing.pack if existing.pack and not _same_session(existing.pack, pack) else existing.prior
+        prior = existing.pack if existing.pack and not same_session(existing.pack, pack) else existing.prior
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(format_pack_file(refs, pack, prior, header_lines), encoding="utf-8")
     _replace(tmp, path)
 
 
-def _same_session(a: PackSection, b: PackSection) -> bool:
+def same_session(a: PackSection, b: PackSection) -> bool:
     da, db = parse_pack_date(a.date_text), parse_pack_date(b.date_text)
     if da and db:
         return da == db

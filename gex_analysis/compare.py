@@ -3,7 +3,7 @@ from pathlib import Path
 from statistics import median
 
 from .config import COMPLEXES
-from .output.pack import SLOT_NAMES, PackSection, derive_basis, read_pack_file
+from .output.pack import SLOT_NAMES, PackSection, derive_basis, read_pack_file, same_session
 
 MAJORS = (("TL", 2), ("DP", 11), ("CW", 0), ("PW", 1))
 RANK_GROUPS = {"GD": slice(3, 7), "C": slice(7, 11)}
@@ -86,6 +86,24 @@ def minor_levels(vendor: PackSection, ours: PackSection, tolerance_pct: float = 
             f"{'':<8} " + "".join(f"{d:>10}" for d in diff) + "   ours - vendor   " + ", ".join(overlaps),
         ]
     return "\n".join(lines)
+
+
+def level_changes(old: PackSection | None, new: PackSection) -> list[str]:
+    """Cash-symbol slots that moved since the previous pack for the same session."""
+    if old is None or not same_session(old, new):
+        return [f"first pack for session {new.date_text}"]
+    lines = []
+    for sym in CASH_SYMBOLS:
+        before, after = old.blocks.get(sym), new.blocks.get(sym)
+        if before is None or after is None:
+            continue
+        moved = [
+            f"{name} {_fmt(a)}→{_fmt(b)}"
+            for name, a, b in zip(SLOT_NAMES, before, after) if round(a, 2) != round(b, 2)
+        ]
+        if moved:
+            lines.append(f"{sym:<4} " + "  ".join(moved))
+    return lines or ["no level changes"]
 
 
 def compare_sections(vendor: PackSection, ours: PackSection) -> str:

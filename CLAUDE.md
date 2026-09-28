@@ -4,8 +4,9 @@
 **Goal:** A self-contained Python service that computes a *richer* gamma analysis than any public vendor exposes, designed specifically to feed into AJ's existing futures scalping infrastructure (ConfluenceAlertSystem, RegimeClassifierV1, LevelTracker) on MES.
 
 ```
-python -m gex_analysis.main --pack-path "<Documents>\NinjaTrader 8\gex_pack_service.txt"
-python -m gex_analysis.compare <vendor gex_pack.txt> <our gex_pack.txt>
+python -m gex_analysis.main --pack-path "<Documents>\NinjaTrader 8\gex_pack_service.txt"             # once
+python -m gex_analysis.main --pack-path "<Documents>\NinjaTrader 8\gex_pack_service.txt" --intraday  # now + every 30 min to 15:45
+python -m gex_analysis.compare <vendor gex_pack.txt> data/packs/<session>_<pre-market HHMM>.txt
 pytest
 ```
 
@@ -193,7 +194,7 @@ Contract multipliers: SPX cash = 100, MES = 5, NQ = 20, MNQ = 2. This field is p
 
 **Path today:** service → `gex_pack.txt` → `GexLevelsPastePack.cs` (hot-reloads within one bar) → its `CurrentGammaRegime` and proximity API → `ConfluenceAlertSystem`. Anything the pack can't carry (continuous magnitudes, half-widths, regime confidence, and later charm and wall tests) goes through the JSON, which needs a separate NT8 reader (Phase 6).
 
-**Cadence.** A discrete job, once daily by default. Open interest is published overnight, so a **pre-market run** (around 08:45 ET) picks up the prior session's final OI, while a post-close run uses OI from the day before. **Confirmed on 28 Sep:** by 08:43 ET, OI had refreshed for SPX/SPY/NDX/QQQ/IWM (+2–8%). The RUT file lagged (last refreshed Saturday) and updated by 09:04, which the per-symbol stale-OI warning now flags. A "run" is the unit of intraday state: `transition_lookback_runs` counts service invocations, not market bars.
+**Cadence.** A pre-market run (once), or `--intraday` for the pre-market run plus a full recompute every 30 minutes through 15:45 (see "Intraday mode"). Open interest is published overnight, so a **pre-market run** (around 08:45 ET) picks up the prior session's final OI, while a post-close run uses OI from the day before. **Confirmed on 28 Sep:** by 08:43 ET, OI had refreshed for SPX/SPY/NDX/QQQ/IWM (+2–8%). The RUT file lagged (last refreshed Saturday) and updated by 09:04, which the per-symbol stale-OI warning now flags. A "run" is the unit of intraday state: `transition_lookback_runs` counts service invocations, not market bars.
 
 ### ConfluenceAlertSystem integration
 
@@ -280,6 +281,22 @@ One file per symbol, plus a combined `SPX_SPY`, `NDX_QQQ` and `RUT_IWM` view (se
 ### Run log: open interest freshness
 
 Each run compares every chain's total open interest with the latest earlier raw archive and prints the change. It warns about any symbol whose OI is unchanged since an **earlier day's** archive, meaning CBOE hasn't refreshed that chain yet (RUT on the morning of 28 Sep), so its levels would rest on stale positioning. It's a warning only; the pack is still written. Re-running later picks up the refresh.
+
+### Intraday mode (`--intraday`)
+
+Runs once immediately (the pre-market run when launched around 08:45), then every `intraday_every_minutes` (30) from `intraday_start` (09:45) to `intraday_end` (15:45) ET. Each run is a **full recompute of all 12 slots** (AJ's choice). The 15-minute feed delay means 09:45 sees the open, and stopping at 15:45 keeps every snapshot before 16:00, so the session date never rolls mid-loop.
+
+- **Housekeeping:**
+  - Raw snapshots are archived at most once per clock hour (about 8 a day instead of 14).
+  - Every pack written is also saved to `data/packs/<session>_<HHMM>.txt`, and each run prints the slots that moved since the previous pack.
+  - A failed fetch is logged and the previous pack stays until the next slot.
+  - Slots more than 5 minutes past (e.g. after the laptop slept) are skipped, not replayed.
+  - Ctrl-C stops cleanly.
+- **Known behaviors (measured 28 Sep, 09:04 vs 11:42 data, SPX −38 pts):**
+  - Open interest is frozen intraday (it only refreshes overnight), so updates reflect price, IV and time decay acting on existing positioning, not new positioning, and they lag 15 minutes.
+  - Walls and ranks re-weight toward spot (PW 7500→7600, CW 7900→7800), and near-ties flip back and forth.
+  - DP moves (+23) can flip `CurrentGammaRegime` (Positive → Battleground) while price sits still.
+- **Daily vendor comparison:** use the pre-market copy in `data/packs/`, since the live pack keeps changing. The pivot log gets a row per run, which is the raw material for studying intraday DP/TL drift.
 
 ### Future output: NT8 JSON ingestion (Phase 6)
 
@@ -437,7 +454,7 @@ The spec showed the NT8 indicator already provides the integration, so the pack 
 
 ### ▶ Next: side-by-side validation (1–2 weeks)
 - **Mon 28 Sep (done):** first like-for-like comparison. Median TL/DP error for SPX/SPY was 0.18% / 0.20%, and walls were exact except SPX CW 7900 vs the vendor's 7800. That's a near tie: our wall confidence was 0.06. It also confirmed the overnight OI refresh and exposed the stale-spot bug, now fixed.
-- Run pre-market daily (Windows Task Scheduler on the NT8 machine), writing to `gex_pack_service.txt` on a second MES chart.
+- Launch `--intraday` around 08:45 daily (WSL on the NT8 machine; keep the terminal open), writing to `gex_pack_service.txt` on a second MES chart.
 - Keep pasting the vendor pack as usual. Run `compare` daily and save the output; the major-levels section (TL/DP first) is what matters.
 - Then decide on per-symbol windows (NDX, IWM) and when to switch the main charts over.
 - Keep `data/pivot_log.csv` accumulating for the combined-pivot test (4–8 weeks).
@@ -470,6 +487,7 @@ An NT8 reader for the JSON fields the pack can't carry, feeding `ConfluenceAlert
 - Implied forward recovers a parity-consistent forward; quarterly expiry roll
 - Pack: 12 slots, Invariants A and B, round trip, `[PRIOR]` roll, atomic write, date parsing, **spec §4 worked example**, and a parse of every vendor reference pack (including the bad QQQ ref)
 - Net walls and box-resistant GD on a synthetic two-sided strike; compare report; open-interest freshness; pivot log
+- Intraday: slot schedule, change report, a no-archive run end to end on a synthetic data source, and the loop's hourly archiving, error survival and missed-slot skipping under a fake clock
 
 ### Layer 2: Vendor comparison (daily, `compare`)
 - **Major levels first:** TL, DP, CW, PW per cash symbol, with point and % differences, plus the median |TL| and |DP| error overall and for SPX/SPY.
@@ -497,7 +515,7 @@ CBOE has no history, so **every run archives the raw snapshots** to `data/raw/<S
 - Custom analytics like "gamma momentum" until the base profile is proven
 - SQLite-backed state
 - Exchange-holiday calendar for session dates, and a warning when TL/DP jump implausibly vs `[PRIOR]` (bad-snapshot guard)
-- An opt-in intraday refresh mode (re-run every N minutes so TL/DP track 0DTE decay; NT8 hot-reloads)
+- Intraday stability options, if flicker bothers AJ in practice: freezing walls/ranks at pre-market values, or hysteresis on near-ties
 - Switching pack pivots to combined index+ETF: only if the pivot-log test supports it
 
 **Rule out:**

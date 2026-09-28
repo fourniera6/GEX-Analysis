@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import time
 from typing import Literal
 
 
@@ -54,3 +55,9 @@ class GexConfig:
     # Futures basis = index options' implied forward at the front quarterly expiry, minus spot.
     futures_roll_days: int = 8
     basis_strike_range_pct: float = 0.03
+
+    # --intraday schedule (ET). The feed is 15 min delayed, so 09:45 sees the open and 15:45 keeps every
+    # snapshot before the 16:00 close, which would otherwise roll the pack to the next session.
+    intraday_start: time = time(9, 45)
+    intraday_end: time = time(15, 45)
+    intraday_every_minutes: int = 30
