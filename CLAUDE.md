@@ -186,7 +186,7 @@ Contract multipliers: SPX cash = 100, MES = 5, NQ = 20, MNQ = 2. This field is p
 
 **Path today:** service → `gex_pack.txt` → `GexLevelsPastePack.cs` (hot-reloads within one bar) → its `CurrentGammaRegime` and proximity API → `ConfluenceAlertSystem`. Anything the pack can't carry (continuous magnitudes, half-widths, regime confidence, and later charm and wall tests) goes through the JSON, which needs a separate NT8 reader (Phase 6).
 
-**Cadence.** A discrete job, once daily by default. Open interest is published overnight, so a **pre-market run** (around 08:45 ET) should pick up the prior session's final OI, while a post-close run uses OI from the day before. Verify this by diffing an evening and a morning snapshot (raw archives are timestamped for this). A "run" is the unit of intraday state: `transition_lookback_runs` counts service invocations, not market bars.
+**Cadence.** A discrete job, once daily by default. Open interest is published overnight, so a **pre-market run** (around 08:45 ET) picks up the prior session's final OI, while a post-close run uses OI from the day before. **Confirmed on 28 Sep:** by 08:43 ET, OI had refreshed for SPX/SPY/NDX/QQQ/IWM (+2–8%). The RUT file lagged (last refreshed Saturday) and updated by 09:04, which the per-symbol stale-OI warning now flags. A "run" is the unit of intraday state: `transition_lookback_runs` counts service invocations, not market bars.
 
 ### ConfluenceAlertSystem integration
 
@@ -257,10 +257,10 @@ Implemented in `output/pack.py`:
 - **Sections:** `[REFS]` (one `SYMBOL price` line per ETF and futures symbol), `[PACK]` (date line + blocks), `[PRIOR]` (the previous session's `[PACK]`, rolled automatically when the session date changes; kept on a same-session rerun).
 - **Blocks, in order:** `ES, MES, NQ, MNQ, RTY, SPX, SPY, NDX, QQQ, RUT, IWM`. Each is `SYMBOL=` followed by 12 `|`-separated values in slot order CW, PW, TL, GD1–4, C1–4, DP, written at full precision. `0` means not available.
 - **Invariant A:** MES ≡ ES and MNQ ≡ NQ, byte-identical.
-- **Invariant B:** each futures block is its index block plus one basis at every slot. The basis is the index options' put-call-parity implied forward at the front quarterly futures expiry (rolled 8 days early), minus spot. On 25 Sep: ES–SPX 62.65 vs the vendor's 63.
+- **Invariant B:** each futures block is its index block plus one basis at every slot. The basis is the index options' put-call-parity implied forward at the front quarterly futures expiry (rolled 8 days early), minus the spot implied by the same quotes (see "Pricing spot" under "Data source"). ES–SPX: 62.65 on 25 Sep vs the vendor's 63, and 61.82 on 28 Sep pre-market vs the vendor's 61.
 - **Invariant C:** ETF blocks are the ETF chain's own levels. The indicator converts them.
 - **The `RUT` block is included,** which gives RTY charts full IWM overlay support (spec §3 gotcha).
-- **Refs:** futures ref = index spot + basis, so `ratio = (futures_ref − basis) / etf_ref = index / ETF` at the same instant.
+- **Refs:** ETF ref = the ETF's official close; futures ref = the index's official close + basis. So `ratio = (futures_ref − basis) / etf_ref = index close / ETF close`, a simultaneous pair even pre-market, when ETFs trade and indexes don't. The ratio drifts only slowly, so a prior-day close pair is accurate to well under a point.
 - **Written atomically** (temp file + `os.replace`, retried briefly if NT8 is mid-read on Windows).
 - A mirror of the indicator's reader (`read_pack_file`, `derive_basis`, `derive_ratio`, `etf_to_futures`) backs the tests, including the spec's §4 worked example.
 
@@ -272,7 +272,7 @@ One file per symbol, plus a combined `SPX_SPY`, `NDX_QQQ` and `RUT_IWM` view (se
 
 ### Run log: open interest freshness
 
-Each run compares every chain's total open interest with the latest earlier raw archive and prints the change. If OI is unchanged for every symbol since an **earlier day's** archive, it prints a warning: CBOE may not have published the new OI yet, so the pack would be built on stale positioning. It's a warning only; the pack is still written. The first Monday pre-market run against Friday evening's archive answers when CBOE refreshes OI.
+Each run compares every chain's total open interest with the latest earlier raw archive and prints the change. It warns about any symbol whose OI is unchanged since an **earlier day's** archive, meaning CBOE hasn't refreshed that chain yet (RUT on the morning of 28 Sep), so its levels would rest on stale positioning. It's a warning only; the pack is still written. Re-running later picks up the refresh.
 
 ### Future output: NT8 JSON ingestion (Phase 6)
 
@@ -287,6 +287,7 @@ An NT8 reader for the JSON (a new indicator, or an extension of `GexLevelsPasteP
 - **Fields per contract:** OCC symbol (root, expiry, C/P, strike), IV, open interest, volume, bid/ask, delta/gamma/vega/theta. SPX has about 29k contracts, SPY about 13k, NDX 15k, RUT 11k.
 - **Settlement times:** AM-settled monthly roots (SPX, NDX, RUT) expire at 09:30; weeklies and ETFs at 16:00. Time to expiry is DST-correct.
 - **Freshness:** 15-minute delayed. After the close, and on weekends, it serves the last session's values.
+- **Pricing spot:** outside regular hours the quote's index level (SPX, NDX, RUT) stays at the prior close, while SPX options keep trading (global trading hours) and ETF quotes move pre-market while their options don't. So each chain is priced at the **spot implied by its own option quotes**: the nearest expiry's put-call-parity forward, discounted by the carry implied between that forward and the futures-expiry forward (`compute/basis.py: underlying_level`). On 28 Sep at 08:43 the SPX quote still showed 7743.41 while its options implied 7717. Using the stale quote had pushed the ES basis to 33 and every ES/MES level about 28 points too low.
 - **Futures basis comes from the same data** (implied forward; see above). No futures feed is needed, so Tickstream isn't required.
 - **Caveats:** It's an unofficial, undocumented endpoint with no SLA; fine for personal use, but it could change or be blocked. It has no history (hence the raw-snapshot archive). CBOE's greeks are rounded to 4 decimals, so we compute gamma ourselves from IV. It has index options only (no ES/MES options), which is why futures levels = index levels + basis.
 - **Upgrade paths**, if it breaks or we outgrow it: Schwab Developer API (free with an account), Tradier production ($10/mo), Marketdata.app Starter ($12/mo, 1-credit cached mode). Each is one new `DataSource` subclass.
@@ -428,7 +429,7 @@ Per-strike dealer GEX, net walls, GD/C ranks, DP and TL, basic regime, JSON outp
 The spec showed the NT8 indicator already provides the integration, so the pack moved ahead of Phases 3–4. It includes all three complexes, the implied-forward basis, auto-rolled `[PRIOR]`, atomic writes and the vendor comparison tool.
 
 ### ▶ Next: side-by-side validation (1–2 weeks)
-- **Mon 28 Sep:** run pre-market (around 08:45 ET) and compare against the vendor's 28 Sep pack. That's the first like-for-like comparison. Read the open-interest lines: a change against Friday evening's archive means CBOE refreshed OI overnight.
+- **Mon 28 Sep (done):** first like-for-like comparison. Median TL/DP error for SPX/SPY was 0.18% / 0.20%, and walls were exact except SPX CW 7900 vs the vendor's 7800. That's a near tie: our wall confidence was 0.06. It also confirmed the overnight OI refresh and exposed the stale-spot bug, now fixed.
 - Run pre-market daily (Windows Task Scheduler on the NT8 machine), writing to `gex_pack_service.txt` on a second MES chart.
 - Keep pasting the vendor pack as usual. Run `compare` daily and save the output; the major-levels section (TL/DP first) is what matters.
 - Then decide on per-symbol windows (NDX, IWM) and when to switch the main charts over.

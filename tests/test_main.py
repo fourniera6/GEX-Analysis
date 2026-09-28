@@ -26,13 +26,13 @@ def test_describe_open_interest_lines_and_staleness():
         current, {"SPX": ("2026-09-25_1802", 180.0), "SPY": ("2026-09-25_1802", 10.0)}, date(2026, 9, 28))
     assert "unchanged vs archive 2026-09-25_1802" in lines[0]
     assert "+100.00% vs archive" in lines[1]
-    assert not stale  # SPY changed
+    assert stale == ["SPX"]  # SPY refreshed, SPX didn't (like RUT on 28 Sep)
 
     same = {"SPX": ("2026-09-25_1802", 180.0), "SPY": ("2026-09-25_1802", 20.0)}
-    assert describe_open_interest(current, same, date(2026, 9, 28))[1]          # unchanged since an earlier day
-    assert not describe_open_interest(current, same, date(2026, 9, 25))[1]      # same-day rerun
+    assert describe_open_interest(current, same, date(2026, 9, 28))[1] == ["SPX", "SPY"]
+    assert describe_open_interest(current, same, date(2026, 9, 25))[1] == []  # same-day rerun
     lines, stale = describe_open_interest(current, {"SPX": None, "SPY": None}, date(2026, 9, 28))
-    assert "no earlier archive" in lines[0] and not stale
+    assert "no earlier archive" in lines[0] and stale == []
 
 
 def test_append_pivot_log_writes_header_once(tmp_path):

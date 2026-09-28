@@ -9,6 +9,7 @@ import numpy as np
 class Chain:
     underlying: str
     spot: float
+    close: float  # the quote's last official close; index and ETF closes are a simultaneous pair
     asof: datetime
     root: np.ndarray
     expiry_date: np.ndarray  # datetime64[D]
