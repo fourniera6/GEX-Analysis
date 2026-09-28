@@ -39,6 +39,7 @@ def parse_payload(underlying: str, raw: bytes) -> Chain:
     return Chain(
         underlying=underlying,
         spot=float(data["current_price"]),
+        close=float(data.get("close") or data["current_price"]),
         asof=asof,
         root=np.array(root),
         expiry_date=np.array(expiry, dtype="datetime64[D]"),

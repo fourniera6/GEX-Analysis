@@ -2,13 +2,13 @@ import argparse
 import csv
 import gzip
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 from pathlib import Path
 
 import numpy as np
 
-from .compute.basis import futures_basis
+from .compute.basis import underlying_level
 from .compute.combine import combine_profiles
 from .compute.expected_move import expected_move_1d
 from .compute.peaks import find_peaks, half_width
@@ -110,7 +110,7 @@ def pivot_row(
     analyses: dict[str, GexAnalysis], combined: GexAnalysis, basis: float,
 ) -> dict:
     """Index-only, ETF-only (on the index scale) and combined TL/DP for one complex."""
-    ratio = chains[c.index].spot / chains[c.etf].spot
+    ratio = chains[c.index].close / chains[c.etf].close
     index, etf = analyses[c.index], analyses[c.etf]
 
     def scaled(v: float | None) -> float | None:
@@ -151,9 +151,9 @@ def previous_open_interest(symbol: str, raw_dir: Path) -> tuple[str, float] | No
 
 def describe_open_interest(
     current: dict[str, float], previous: dict[str, tuple[str, float] | None], today: date
-) -> tuple[list[str], bool]:
-    """One line per symbol, and whether OI looks stale: unchanged everywhere since an earlier day's archive."""
-    lines = []
+) -> tuple[list[str], list[str]]:
+    """One line per symbol, and the symbols whose OI is unchanged since an earlier day's archive (likely stale)."""
+    lines, stale = [], []
     for sym, total in current.items():
         prev = previous.get(sym)
         if prev is None:
@@ -162,12 +162,8 @@ def describe_open_interest(
         label, prev_total = prev
         change = "unchanged" if total == prev_total else f"{100 * (total / prev_total - 1):+.2f}%"
         lines.append(f"{sym:<4} OI {total:>12,.0f}  ({change} vs archive {label})")
-    earlier = [p for p in previous.values() if p is not None]
-    stale = (
-        len(earlier) == len(current)
-        and all(current[s] == previous[s][1] for s in current)
-        and all(date.fromisoformat(label[:10]) < today for label, _ in earlier)
-    )
+        if total == prev_total and date.fromisoformat(label[:10]) < today:
+            stale.append(sym)
     return lines, stale
 
 
@@ -179,7 +175,7 @@ class RunResult:
     pack_path: Path
     pivot_rows: list[dict]
     open_interest_lines: list[str]
-    stale_open_interest: bool
+    stale_open_interest: list[str]
 
 
 def run(
@@ -207,6 +203,15 @@ def run(
     for sym, chain in chains.items():
         (raw_dir / f"{sym}_{fetched:%Y-%m-%d_%H%M}.json.gz").write_bytes(gzip.compress(chain.raw))
 
+    # Price everything at the level implied by each chain's own option quotes: outside regular hours the quoted
+    # index level is stale while SPX options still trade, and ETF quotes move pre-market while their options don't.
+    levels = {
+        s: underlying_level(ch, cfg.risk_free_rate, cfg.futures_roll_days, cfg.basis_strike_range_pct)
+        for s, ch in chains.items()
+    }
+    chains = {s: replace(ch, spot=levels[s][0]) for s, ch in chains.items()}
+    bases = {c.index: round(levels[c.index][1] - levels[c.index][0], 2) for c in COMPLEXES}
+
     structural = {s: ContractSet.from_chain(ch, cfg, cfg.structural_window_dte) for s, ch in chains.items()}
     transition = {s: ContractSet.from_chain(ch, cfg, cfg.transition_window_dte) for s, ch in chains.items()}
     profiles = {s: structural[s].profile(ch.spot) for s, ch in chains.items()}
@@ -215,16 +220,12 @@ def run(
         s: build_analysis(s, ch.spot, ch.asof, profiles[s], structural[s].total_gex, transition[s].total_gex, moves[s], cfg)
         for s, ch in chains.items()
     }
-    bases = {
-        c.index: futures_basis(chains[c.index], cfg.risk_free_rate, cfg.futures_roll_days, cfg.basis_strike_range_pct)
-        for c in COMPLEXES
-    }
 
     # Research only: index + ETF gamma combined. Not used in the pack.
     combined, pivot_rows = {}, []
     for c in COMPLEXES:
         index = chains[c.index]
-        ratio = index.spot / chains[c.etf].spot
+        ratio = index.close / chains[c.etf].close
         name = f"{c.index}_{c.etf}"
         combined[name] = build_analysis(
             name, index.spot, index.asof,
@@ -242,13 +243,14 @@ def run(
     pack_path = pack_path or out_dir / "gex_pack.txt"
     write_pack_file(
         pack_path,
-        build_refs({s: ch.spot for s, ch in chains.items()}, bases),
+        build_refs({s: ch.close for s, ch in chains.items()}, bases),
         build_pack({s: pack_levels(a) for s, a in analyses.items()}, bases, session),
         [
             f"Generated {fetched:%Y-%m-%d %H:%M} ET by gex-analysis from CBOE delayed quotes "
             f"(SPX data as of {chains['SPX'].asof:%Y-%m-%d %H:%M} ET).",
             "Futures blocks = index levels + basis implied by index options at the front futures expiry.",
-            "[REFS] futures = index spot + that basis, so each ETF/futures pair is one simultaneous observation.",
+            "[REFS] ETF = its official close; futures = the index's official close + that basis, "
+            "so each pair is simultaneous even when run outside regular hours.",
         ],
     )
     return RunResult({**analyses, **combined}, bases, session, pack_path, pivot_rows, oi_lines, stale_oi)
@@ -295,8 +297,9 @@ def main() -> None:
     for line in result.open_interest_lines:
         print(f"  {line}")
     if result.stale_open_interest:
-        print("  WARNING: open interest is unchanged since an earlier day's snapshot. CBOE may not have published "
-              "today's OI yet, so this pack may be built on stale positioning. Consider re-running later.")
+        print(f"  WARNING: open interest unchanged since an earlier day's snapshot for "
+              f"{', '.join(result.stale_open_interest)}. CBOE may not have refreshed that data yet, so those levels "
+              "may be built on stale positioning. Consider re-running later.")
 
     bases = "  ".join(f"{c.futures[0]}-{c.index} {result.bases[c.index]:+.2f}" for c in COMPLEXES)
     print(f"\nBasis: {bases}\nPack for session {result.session} written to {result.pack_path}")
