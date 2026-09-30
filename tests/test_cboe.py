@@ -58,3 +58,29 @@ def test_expected_move_uses_nearest_two_sided_expiry():
         _option("SPXW260930C07800000", bid=5.0, ask=6.0),
     ]))
     assert expected_move_1d(chain) == pytest.approx(61.0 / np.sqrt(3))
+
+
+def test_expired_contracts_drop_out_after_the_close():
+    # ETF quotes stop at 15:59:59, one second before the 16:00 expiry. A 07:29 run the next morning must not
+    # treat that day's expired 0DTE options as live (they'd get the 15-minute time floor and phantom gamma).
+    raw = json.dumps({"timestamp": "2026-09-29 11:29:00", "data": {
+        "current_price": 280.06, "last_trade_time": "2026-09-28T15:59:59",
+        "options": [
+            _option("IWM260928C00280000", bid=0.05, ask=0.25),   # expired yesterday
+            _option("IWM260928P00280000", bid=0.05, ask=0.25),
+            _option("IWM260929C00280000", bid=1.2, ask=1.3),     # today's 0DTE
+            _option("IWM260929P00280000", bid=1.1, ask=1.2),
+        ],
+    }}).encode()
+    chain = parse_payload("IWM", raw)
+    assert f"{chain.quote_time:%Y-%m-%d %H:%M}" == "2026-09-29 07:29"
+    assert list(chain.alive) == [False, False, True, True]
+    assert list(ContractSet.from_chain(chain, GexConfig(), (0, 7)).strike) == [280.0, 280.0]
+    assert expected_move_1d(chain) == pytest.approx(2.4)       # today's straddle, not yesterday's 0.30
+
+
+def test_quote_time_never_precedes_the_last_trade():
+    raw = json.dumps({"timestamp": "2026-09-26 03:44:18", "data": {  # a stale file stamp
+        "current_price": 2837.5, "last_trade_time": "2026-09-28T16:09:55", "options": [_option("RUTW260929C02840000")]}}).encode()
+    chain = parse_payload("RUT", raw)
+    assert chain.quote_time == chain.asof

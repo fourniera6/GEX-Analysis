@@ -1,5 +1,5 @@
 import json
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -22,8 +22,11 @@ def parse_occ(symbol: str) -> tuple[str, date, bool, float]:
 
 
 def parse_payload(underlying: str, raw: bytes) -> Chain:
-    data = json.loads(raw)["data"]
+    payload = json.loads(raw)
+    data = payload["data"]
     asof = datetime.fromisoformat(data["last_trade_time"]).replace(tzinfo=ET)
+    stamp = payload.get("timestamp")  # file time, UTC
+    quote_time = max(asof, datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc).astimezone(ET)) if stamp else asof
 
     rows = []
     for o in data["options"]:
@@ -41,6 +44,7 @@ def parse_payload(underlying: str, raw: bytes) -> Chain:
         spot=float(data["current_price"]),
         close=float(data.get("close") or data["current_price"]),
         asof=asof,
+        quote_time=quote_time,
         root=np.array(root),
         expiry_date=np.array(expiry, dtype="datetime64[D]"),
         t_years=np.array(t_years),

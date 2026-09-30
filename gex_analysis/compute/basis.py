@@ -46,7 +46,7 @@ def underlying_level(chain: Chain, r: float, roll_days: int, strike_range_pct: f
     """
     far = front_quarterly_expiry(chain.asof.date(), roll_days)
     f_far, t_far = implied_forward(chain, far, r, strike_range_pct)
-    live = (chain.t_years > 0) & (chain.bid > 0) & (chain.ask > 0) & (chain.expiry_date < np.datetime64(far, "D"))
+    live = chain.alive & (chain.bid > 0) & (chain.ask > 0) & (chain.expiry_date < np.datetime64(far, "D"))
     for expiry in np.unique(chain.expiry_date[live]):
         try:
             f_near, t_near = implied_forward(chain, expiry.item(), r, strike_range_pct)

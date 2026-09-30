@@ -37,7 +37,7 @@ class ContractSet:
         lo, hi = window_dte
         dte = (chain.expiry_date - np.datetime64(chain.asof.date(), "D")).astype(int)
         keep = (
-            (chain.t_years > 0) & (dte >= lo) & (dte <= hi)
+            chain.alive & (dte >= lo) & (dte <= hi)
             & (chain.open_interest > 0) & (chain.iv > 0)
         )
         is_call = chain.is_call[keep]
