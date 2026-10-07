@@ -24,6 +24,7 @@ from .data_sources.base import Chain, DataSource
 from .data_sources.cboe import ET, CboeDelayedSource, parse_payload
 from .output.analysis import GammaPeak, GexAnalysis, WallInfo
 from .output.pack import (
+    HistoryEntry,
     PackSection,
     build_pack,
     build_refs,
@@ -33,6 +34,7 @@ from .output.pack import (
     same_session,
     write_pack_file,
 )
+from .timeline import write_timeline
 
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
@@ -206,6 +208,7 @@ class RunResult:
     changes: list[str]
     drift: list[str]
     history_path: Path
+    timeline_path: Path | None = None
 
 
 def run(
@@ -287,6 +290,9 @@ def run(
     # [PREMARKET] = the session's levels as of the open: set by any run before 09:30, then kept all session.
     kept = existing.premarket if existing and existing.premarket and same_session(existing.premarket, pack) else None
     premarket = pack if kept is None or fetched.time() < MARKET_OPEN else kept
+    # [HISTORY] = every pack written this session, so the chart and the timeline page can show the moves.
+    history = existing.history if existing and existing.pack and same_session(existing.pack, pack) else []
+    history = [*history, HistoryEntry(fetched.replace(tzinfo=None, second=0, microsecond=0), pack.blocks)]
     write_pack_file(
         pack_path,
         build_refs({s: ch.close for s, ch in chains.items()}, bases),
@@ -298,15 +304,23 @@ def run(
             "[REFS] ETF = its official close; futures = the index's official close + that basis, "
             "so each pair is simultaneous even when run outside regular hours.",
             "[PREMARKET] = this session's levels as of the open (service extension; ignored by the current indicator).",
+            "[HISTORY] = every pack written this session, one line each: write time (ET), then its blocks "
+            "(service extension; see docs/NT8-HISTORY-RENDERING.md).",
         ],
         premarket,
+        history,
     )
     history_path = raw_dir.parent / "packs" / f"{session}_{fetched:%H%M}.txt"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     history_path.write_text(pack_path.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        timeline_path = write_timeline(session, history_path.parent, pivot_log, out_dir)
+    except Exception as err:  # the page is a convenience: never let it cost a pack update
+        print(f"WARNING: timeline page not updated: {err!r}")
+        timeline_path = None
     return RunResult(
         {**analyses, **combined}, bases, session, pack_path, pivot_rows, oi_lines, stale_oi,
-        level_changes(previous, pack), drift_report(premarket, pack), history_path,
+        level_changes(previous, pack), drift_report(premarket, pack), history_path, timeline_path,
     )
 
 
@@ -347,6 +361,8 @@ def print_changes(result: RunResult) -> None:
         for line in result.drift:
             print(f"  {line}")
     print(f"\nPack for session {result.session} written to {result.pack_path} (copy: {result.history_path})")
+    if result.timeline_path:
+        print(f"Timeline: {result.timeline_path} (reload it in the browser after each update)")
 
 
 def print_summary(result: RunResult) -> None:

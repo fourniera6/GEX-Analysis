@@ -26,11 +26,18 @@ class PackSection:
 
 
 @dataclass
+class HistoryEntry:
+    written: datetime  # when this pack was written (ET): from then on it was on the chart
+    blocks: dict[str, list[float]]
+
+
+@dataclass
 class PackFile:
     refs: dict[str, float] = field(default_factory=dict)
     pack: PackSection | None = None
     prior: PackSection | None = None
     premarket: PackSection | None = None  # service extension; the indicator ignores unknown sections
+    history: list[HistoryEntry] = field(default_factory=list)  # service extension: every pack this session
     warnings: list[str] = field(default_factory=list)
 
 
@@ -88,9 +95,18 @@ def format_number(v: float) -> str:
     return f"{v:.10g}"
 
 
+def _format_blocks(blocks: dict[str, list[float]]) -> list[str]:
+    return [f"{sym}=" + "|".join(format_number(v) for v in vals) for sym, vals in blocks.items()]
+
+
 def _format_section(name: str, section: PackSection) -> list[str]:
-    blocks = [f"{sym}=" + "|".join(format_number(v) for v in vals) for sym, vals in section.blocks.items()]
+    blocks = _format_blocks(section.blocks)
     return [f"[{name}]", section.date_text, *(b + ";" for b in blocks[:-1]), blocks[-1], ""]
+
+
+def _format_history(history: list[HistoryEntry]) -> list[str]:
+    # One line per pack: its write time, then its blocks. Not space-joined like [PACK]: each line stands alone.
+    return ["[HISTORY]", *(f"{h.written:%Y-%m-%dT%H:%M} " + ";".join(_format_blocks(h.blocks)) for h in history), ""]
 
 
 def format_pack_file(
@@ -99,6 +115,7 @@ def format_pack_file(
     prior: PackSection | None,
     header_lines: list[str] = (),
     premarket: PackSection | None = None,
+    history: list[HistoryEntry] = (),
 ) -> str:
     lines = [f"# {h}" for h in header_lines]
     lines += ["[REFS]", *(f"{sym} {format_number(p)}" for sym, p in refs.items()), ""]
@@ -107,6 +124,8 @@ def format_pack_file(
         lines += _format_section("PRIOR", prior)
     if premarket is not None:
         lines += _format_section("PREMARKET", premarket)
+    if history:
+        lines += _format_history(history)
     return "\n".join(lines)
 
 
@@ -116,6 +135,7 @@ def write_pack_file(
     pack: PackSection,
     header_lines: list[str] = (),
     premarket: PackSection | None = None,
+    history: list[HistoryEntry] = (),
 ) -> None:
     """Atomic write. The existing [PACK] rolls into [PRIOR] when the session date changes."""
     prior = None
@@ -123,7 +143,7 @@ def write_pack_file(
         existing = read_pack_file(path.read_text(encoding="utf-8"))
         prior = existing.pack if existing.pack and not same_session(existing.pack, pack) else existing.prior
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(format_pack_file(refs, pack, prior, header_lines, premarket), encoding="utf-8")
+    tmp.write_text(format_pack_file(refs, pack, prior, header_lines, premarket, history), encoding="utf-8")
     _replace(tmp, path)
 
 
@@ -171,6 +191,16 @@ def read_pack_file(text: str) -> PackFile:
             section, warnings = parse_pack_string(" ".join(sections[name]))
             setattr(result, name.lower(), section)
             result.warnings += [f"[{name}] {w}" for w in warnings]
+    for line in sections.get("HISTORY", []):
+        stamp, _, rest = line.partition(" ")
+        try:
+            written = datetime.fromisoformat(stamp)
+        except ValueError:
+            result.warnings.append(f"[HISTORY] bad time in {line[:40]!r}")
+            continue
+        section, warnings = parse_pack_string(rest)
+        result.history.append(HistoryEntry(written, section.blocks))
+        result.warnings += [f"[HISTORY] {stamp} {w}" for w in warnings]
     return result
 
 

@@ -7,6 +7,7 @@
 python -m gex_analysis.main --pack-path "<Documents>\NinjaTrader 8\gex_pack_service.txt"             # once
 python -m gex_analysis.main --pack-path "<Documents>\NinjaTrader 8\gex_pack_service.txt" --intraday  # now + every 30 min to 15:45
 python -m gex_analysis.compare <vendor gex_pack.txt> data/packs/<session>_<pre-market HHMM>.txt
+python -m gex_analysis.timeline [YYYY-MM-DD]   # page showing how the levels moved through a session
 pytest
 ```
 
@@ -270,6 +271,7 @@ Implemented in `output/pack.py`:
 - **Invariant B:** each futures block is its index block plus one basis at every slot. The basis is the index options' put-call-parity implied forward at the front quarterly futures expiry (rolled 8 days early), minus the spot implied by the same quotes (see "Pricing spot" under "Data source"). ES–SPX: 62.65 on 25 Sep vs the vendor's 63, and 61.82 on 28 Sep pre-market vs the vendor's 61.
 - **Invariant C:** ETF blocks are the ETF chain's own levels. The indicator converts them.
 - **`[PREMARKET]` (service extension):** the session's levels as of the open, in the same block format as `[PACK]` (futures included). Any run before 09:30 ET sets it, intraday updates keep it, and the next session replaces it. The current indicator ignores unknown sections, so it's safe today. To draw it, `GexLevelsPastePack.cs` can reuse the `[PRIOR]` path (`BuildPriorDayLevels`) with a "PM" label: dotted ghost line when a current level has drifted more than 8 ticks away, a "• PM" tag when it hasn't.
+- **`[HISTORY]` (service extension):** every pack written this session, one line each: the write time (ET, `2026-10-07T15:42`), a space, then that pack's v2 blocks. It restarts with each new session, and its last line equals `[PACK]`. The current indicator ignores it. `docs/NT8-HISTORY-RENDERING.md` is the indicator-side spec for drawing each level as a stepped line.
 - **The `RUT` block is included,** which gives RTY charts full IWM overlay support (spec §3 gotcha).
 - **Refs:** ETF ref = the ETF's official close; futures ref = the index's official close + basis. So `ratio = (futures_ref − basis) / etf_ref = index close / ETF close`, a simultaneous pair even pre-market, when ETFs trade and indexes don't. The ratio drifts only slowly, so a prior-day close pair is accurate to well under a point.
 - **Written atomically** (temp file + `os.replace`, retried briefly if NT8 is mid-read on Windows).
@@ -306,6 +308,20 @@ Runs once immediately (the pre-market run when launched around 08:45), then ever
   - A held wall's confidence reads 0, since it's a tie by construction.
   - Replaying 28 Sep: SPX PW held 7500 all day (fresh flipped to 7600), SPY PW held 750 (fresh 761), and QQQ's 730/738 flicker disappeared. SPX CW still moved 7900→7800 because 7800 overtook it decisively (confidence 0.49).
 - **Pre-market reference:** every update prints the major levels that differ from `[PREMARKET]`, e.g. `SPX  TL 7710 (pre 7702.70, +7.3)  DP 7683.70 (pre 7661.10, +22.6)`. On 28 Sep the pre-market DP (7661) sat 5.6 points under the day's low while the intraday DP (7684–7687) was where price chopped. Both mattered, which is why the pre-market levels are kept.
+
+### Seeing the moves: timeline page and chart history
+
+Intraday updates move levels: walls migrate toward spot late in the day (SPY PW 767→777 at 15:42 on 7 Oct), and DP drifts. Two views show the session as a whole:
+
+- **`output/timeline_<session>.html`** (`gex_analysis/timeline.py`).
+  - It's rewritten after every run, so reloading the browser during `--intraday` shows the latest state. `python -m gex_analysis.timeline [session] [--all]` builds it for any recorded session from `data/packs/` and the pivot log's spots.
+  - It has one panel per cash symbol: step lines for TL/DP/CW/PW, spot, pre-market references (dashed), faint GD/C ticks, labels where walls jumped, and a table of each update's levels and changes.
+  - Walls too far from spot are listed under the chart instead of being squeezed in.
+  - It's self-contained HTML (no network). From WSL: `explorer.exe "$(wslpath -w output/timeline_<session>.html)"`.
+- **On the chart:** the pack's `[HISTORY]` section, once `GexLevelsPastePack.cs` implements `docs/NT8-HISTORY-RENDERING.md`.
+  - For sessions recorded before `[HISTORY]` existed, `--pack-with-history PATH` rebuilds one to test against.
+
+Both place a level at the time its pack was **written** (when it reached the chart), not its data time (about 15 minutes earlier), so there's no look-ahead when judging reactions.
 
 ### Future output: NT8 JSON ingestion (Phase 6)
 
@@ -359,6 +375,7 @@ gex_analysis/
 ├── config.py                    # GexConfig methodology knobs + COMPLEXES (index, ETF, futures)
 ├── main.py                      # daily orchestrator: fetch, archive, compute, JSON + pack
 ├── compare.py                   # vendor pack vs ours: major levels first, then the full grid
+├── timeline.py                  # per-session HTML page: how the levels moved, from data/packs/
 ├── data_sources/
 │   ├── base.py                  # Chain dataclass, DataSource ABC
 │   └── cboe.py                  # CBOE delayed quotes: OCC parsing, settlement times
@@ -376,6 +393,7 @@ gex_analysis/
     ├── analysis.py              # GexAnalysis dataclasses + JSON
     └── pack.py                  # gex_pack.txt writer + mirror reader
 docs/GEX-PACK-SPEC.md            # NT8 pack contract (wins on format)
+docs/NT8-HISTORY-RENDERING.md    # indicator-side spec for drawing [HISTORY] / [PREMARKET]
 validation/reference_packs/      # vendor packs for comparison
 tests/                           # pytest: math, parsing, basis, pack invariants, spec §4 example
 data/raw/, output/               # generated; not in git (back up data/raw — it's our history)
@@ -503,6 +521,7 @@ An NT8 reader for the JSON fields the pack can't carry, feeding `ConfluenceAlert
 - Net walls and box-resistant GD on a synthetic two-sided strike; compare report; open-interest freshness; pivot log
 - Intraday: slot schedule, change report, a no-archive run end to end on a synthetic data source, and the loop's hourly archiving, error survival, missed-slot skipping and fresh-then-held runs under a fake clock
 - Hysteresis (`sticky_peaks`, held walls in `build_analysis`), `[PREMARKET]` round trip and its set/keep/reset rules, drift report
+- `[HISTORY]` round trip and its append/reset rules; timeline loading (spot join, run order), page content (panels, wall-jump labels, off-chart walls, change log) and the `[HISTORY]` backfill
 
 ### Layer 2: Vendor comparison (daily, `compare`)
 - **Major levels first:** TL, DP, CW, PW per cash symbol, with point and % differences, plus the median |TL| and |DP| error overall and for SPX/SPY.
@@ -531,7 +550,7 @@ CBOE has no history, so **every run archives the raw snapshots** to `data/raw/<S
 - SQLite-backed state
 - Exchange-holiday calendar for session dates, and a warning when TL/DP jump implausibly vs `[PRIOR]` (bad-snapshot guard)
 - Freezing walls/ranks at pre-market values all day (stronger than the 20% hysteresis), if flicker still bothers AJ in practice
-- NT8 rendering of `[PREMARKET]` in `GexLevelsPastePack.cs` (AJ's side; see the pack contract)
+- NT8 rendering of `[HISTORY]` and `[PREMARKET]` in `GexLevelsPastePack.cs` (AJ's side; spec in `docs/NT8-HISTORY-RENDERING.md`)
 - Switching pack pivots to combined index+ETF: only if the pivot-log test supports it
 
 **Rule out:**

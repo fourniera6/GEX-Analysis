@@ -173,3 +173,23 @@ def test_premarket_section_round_trips_without_disturbing_pack_and_prior():
     assert parsed.pack.date_text == "28 SEP 2026" and parsed.prior.date_text == "25 SEP 2026"
     assert parsed.premarket.blocks["SPX"] == pytest.approx(pre.blocks["SPX"])
     assert parsed.pack.blocks["SPX"] == pytest.approx(pack.blocks["SPX"])
+
+
+def test_history_section_round_trips_line_by_line_and_stays_out_of_pack():
+    from datetime import datetime
+
+    from gex_analysis.output.pack import HistoryEntry
+
+    pack, early = _section(date(2026, 9, 28)), _section(date(2026, 9, 28))
+    early.blocks["SPX"] = [x + 5 if x else 0.0 for x in early.blocks["SPX"]]
+    history = [HistoryEntry(datetime(2026, 9, 28, 8, 29), early.blocks), HistoryEntry(datetime(2026, 9, 28, 9, 45), pack.blocks)]
+    text = format_pack_file({"SPY": 771.35}, pack, None, ["h"], pack, history)
+    assert "\n2026-09-28T08:29 ES=" in text and "\n2026-09-28T09:45 ES=" in text  # one line per pack
+
+    parsed = read_pack_file(text)
+    assert parsed.warnings == []
+    assert [h.written for h in parsed.history] == [datetime(2026, 9, 28, 8, 29), datetime(2026, 9, 28, 9, 45)]
+    assert parsed.history[0].blocks["SPX"] == pytest.approx(early.blocks["SPX"])
+    assert list(parsed.history[1].blocks) == list(pack.blocks)
+    without = read_pack_file(format_pack_file({"SPY": 771.35}, pack, None, ["h"], pack))
+    assert parsed.pack == without.pack and parsed.premarket == without.premarket and without.history == []

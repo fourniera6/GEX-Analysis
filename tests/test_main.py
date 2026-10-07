@@ -123,6 +123,8 @@ def test_premarket_is_set_before_the_open_and_kept_through_the_session(tmp_path)
     morning = run(source=FakeSource(), now=datetime(2026, 9, 28, 8, 45, tzinfo=ET), **kwargs)
     pre = read_pack_file(morning.pack_path.read_text())
     assert pre.premarket.blocks == pre.pack.blocks and morning.drift == []
+    assert [h.written for h in pre.history] == [datetime(2026, 9, 28, 8, 45)]
+    assert morning.timeline_path == tmp_path / "output" / "timeline_2026-09-28.html"
 
     midday = run(source=FakeSource(shift=-0.01), now=datetime(2026, 9, 28, 11, 45, tzinfo=ET),
                  hold_levels=True, **kwargs)
@@ -132,11 +134,20 @@ def test_premarket_is_set_before_the_open_and_kept_through_the_session(tmp_path)
     assert midday.history_path.name == "2026-09-28_1145.txt"
 
     assert after.pack.blocks["SPY"][0] == pre.pack.blocks["SPY"][0]  # CW held: the shifted data alone picks 775
+    assert [(h.written.hour, h.blocks) for h in after.history] == [(8, pre.pack.blocks), (11, after.pack.blocks)]
+    assert "11:45" in midday.timeline_path.read_text()
 
     rerun = run(source=FakeSource(shift=-0.01), now=datetime(2026, 9, 28, 9, 10, tzinfo=ET), **kwargs)
     reread = read_pack_file(rerun.pack_path.read_text())
     assert reread.premarket.blocks == reread.pack.blocks != pre.pack.blocks  # a pre-open rerun resets it
     assert reread.pack.blocks["SPY"][0] == 775.0                              # and isn't held
+    assert [h.written.strftime("%H%M") for h in reread.history] == ["0845", "1145", "0910"]  # in write order
+
+    path = rerun.pack_path
+    path.write_text(path.read_text().replace("28 SEP 2026", "25 SEP 2026"))  # as if left over from the last session
+    nextday = read_pack_file(run(source=FakeSource(), now=datetime(2026, 9, 28, 8, 40, tzinfo=ET), **kwargs)
+                             .pack_path.read_text())
+    assert [h.written.strftime("%H%M") for h in nextday.history] == ["0840"]  # a new session starts a new history
 
 
 def test_intraday_slots():
