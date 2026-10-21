@@ -84,7 +84,7 @@ Ranks keep strikes at least 0.25% of spot apart, include levels on either side o
 - CW/PW exact everywhere except SPX CW 7900 vs the vendor's 7800. Our wall confidence there was 0.06, a near tie, so treat 7800–7900 as the resistance zone.
 - SPX C set matches 4/4 (only the order differs). ES basis: 61.72 vs the vendor's 61.
 
-**29 Sep (07:29 pre-market run):** SPX/SPY median |TL| 0.04%, |DP| 0.25%. SPY TL/DP/CW/PW all within 0.4. SPX DP +34 (the vendor's DP sits persistently below ours: +20 on 28 Sep, +34 on 29 Sep; watch this). The vendor's SPX PW moved to 7650 (ours 7600, with 7650 as GD3). IWM TL −2.65% was the expired-contract bug, since fixed. RUT OI hadn't refreshed by 07:29.
+**29 Sep (07:29 pre-market run):** SPX/SPY median |TL| 0.04%, |DP| 0.25%. SPY TL/DP/CW/PW all within 0.4. SPX DP +34 (the vendor's DP sits persistently below ours: +20 on 28 Sep, +34 on 29 Sep; later +43, −12, +22 and +42.9 on 13 Oct, when NDX was +216 while SPY/QQQ matched within 0.4%). `python -m gex_analysis.research.dp_variants --vendor <vendor pack> [--stamp <raw archive stamp>]` recomputes DP from a saved snapshot under different expiry windows, strike bands, weeklies-only and snapshot-clock variants, and ranks them against the vendor separately for indexes and ETFs. It's read-only, and findings belong here only once a variant wins on several days. The vendor's SPX PW moved to 7650 (ours 7600, with 7650 as GD3). IWM TL −2.65% was the expired-contract bug, since fixed. RUT OI hadn't refreshed by 07:29.
 
 **Reading wall confidence:** near 0 means the runner-up strike carries almost the same net gamma. Treat the two as a zone rather than trusting which one ranked first.
 
@@ -376,6 +376,8 @@ gex_analysis/
 ├── main.py                      # daily orchestrator: fetch, archive, compute, JSON + pack
 ├── compare.py                   # vendor pack vs ours: major levels first, then the full grid
 ├── timeline.py                  # per-session HTML page: how the levels moved, from data/packs/
+├── research/
+│   └── dp_variants.py           # read-only: which contract set reproduces the vendor's DP
 ├── data_sources/
 │   ├── base.py                  # Chain dataclass, DataSource ABC
 │   └── cboe.py                  # CBOE delayed quotes: OCC parsing, settlement times
@@ -521,6 +523,7 @@ An NT8 reader for the JSON fields the pack can't carry, feeding `ConfluenceAlert
 - Net walls and box-resistant GD on a synthetic two-sided strike; compare report; open-interest freshness; pivot log
 - Intraday: slot schedule, change report, a no-archive run end to end on a synthetic data source, and the loop's hourly archiving, error survival, missed-slot skipping and fresh-then-held runs under a fake clock
 - Hysteresis (`sticky_peaks`, held walls in `build_analysis`), `[PREMARKET]` round trip and its set/keep/reset rules, drift report
+- DP research variants: the 0–365 variant reproduces the production DP from the same archive; masks; ranking report
 - `[HISTORY]` round trip and its append/reset rules; timeline loading (spot join, run order), page content (panels, wall-jump labels, off-chart walls, change log) and the `[HISTORY]` backfill
 
 ### Layer 2: Vendor comparison (daily, `compare`)

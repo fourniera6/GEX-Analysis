@@ -33,13 +33,18 @@ class ContractSet:
     q: float
 
     @classmethod
-    def from_chain(cls, chain: Chain, cfg: GexConfig, window_dte: tuple[int, int]) -> "ContractSet":
+    def from_chain(
+        cls, chain: Chain, cfg: GexConfig, window_dte: tuple[int, int], extra_mask: np.ndarray | None = None,
+    ) -> "ContractSet":
+        """extra_mask: an optional per-contract filter on top of the usual ones (research variants)."""
         lo, hi = window_dte
         dte = (chain.expiry_date - np.datetime64(chain.asof.date(), "D")).astype(int)
         keep = (
             chain.alive & (dte >= lo) & (dte <= hi)
             & (chain.open_interest > 0) & (chain.iv > 0)
         )
+        if extra_mask is not None:
+            keep &= extra_mask
         is_call = chain.is_call[keep]
         call_sign = 1.0 if cfg.dealer_long_calls else -1.0
         put_sign = -1.0 if cfg.dealer_short_puts else 1.0
