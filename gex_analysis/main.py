@@ -211,6 +211,42 @@ class RunResult:
     timeline_path: Path | None = None
 
 
+def _price_chains(
+    chains: dict[str, Chain], source: DataSource, cfg: GexConfig, archive_path: Callable[[str], Path] | None,
+) -> tuple[dict[str, Chain], dict[str, float]]:
+    """Price every chain at the level implied by its own option quotes, and each index's futures basis.
+
+    Outside regular hours the quoted index level is stale while SPX options still trade, and ETF quotes move
+    pre-market while their options don't. CBOE's file sometimes lacks the quotes for a moment (IWM's Dec expiry on
+    21 Oct, SPX at the open on 7 Oct), so a failing symbol is re-fetched; an ETF then falls back to its quoted price.
+    """
+    indexes = {c.index for c in COMPLEXES}
+    priced, forwards = {}, {}
+    for sym, chain in chains.items():
+        for attempt in range(cfg.quote_retry_attempts + 1):
+            try:
+                spot, forwards[sym] = underlying_level(
+                    chain, cfg.risk_free_rate, cfg.futures_roll_days, cfg.basis_strike_range_pct)
+                break
+            except ValueError as err:
+                if attempt < cfg.quote_retry_attempts:
+                    print(f"{sym}: {err}; refetching in {cfg.quote_retry_seconds:g}s")
+                    sleep(cfg.quote_retry_seconds)
+                    chain = source.fetch_chain(sym)
+                    if archive_path:
+                        archive_path(sym).write_bytes(gzip.compress(chain.raw))
+                elif sym in indexes:
+                    raise ValueError(f"{err} after {attempt + 1} tries; CBOE's file is likely mid-update, "
+                                     "so try again in a few minutes") from err
+                else:
+                    print(f"WARNING: {sym}: {err}; its levels use the quoted price {chain.spot:.2f} instead of the "
+                          "price implied by its options.")
+                    spot = chain.spot
+        priced[sym] = replace(chain, spot=spot)
+    bases = {c.index: round(forwards[c.index] - priced[c.index].spot, 2) for c in COMPLEXES}
+    return priced, bases
+
+
 def run(
     cfg: GexConfig | None = None,
     source: DataSource | None = None,
@@ -244,18 +280,14 @@ def run(
         {s: previous_open_interest(s, raw_dir) for s in chains},
         fetched.date(),
     )
-    if archive:
-        for sym, chain in chains.items():
-            (raw_dir / f"{sym}_{fetched:%Y-%m-%d_%H%M}.json.gz").write_bytes(gzip.compress(chain.raw))
+    def archive_path(sym: str) -> Path:
+        return raw_dir / f"{sym}_{fetched:%Y-%m-%d_%H%M}.json.gz"
 
-    # Price everything at the level implied by each chain's own option quotes: outside regular hours the quoted
-    # index level is stale while SPX options still trade, and ETF quotes move pre-market while their options don't.
-    levels = {
-        s: underlying_level(ch, cfg.risk_free_rate, cfg.futures_roll_days, cfg.basis_strike_range_pct)
-        for s, ch in chains.items()
-    }
-    chains = {s: replace(ch, spot=levels[s][0]) for s, ch in chains.items()}
-    bases = {c.index: round(levels[c.index][1] - levels[c.index][0], 2) for c in COMPLEXES}
+    if archive:  # before pricing, so a snapshot that can't be priced is still on disk
+        for sym, chain in chains.items():
+            archive_path(sym).write_bytes(gzip.compress(chain.raw))
+
+    chains, bases = _price_chains(chains, source, cfg, archive_path if archive else None)
 
     structural = {s: ContractSet.from_chain(ch, cfg, cfg.structural_window_dte) for s, ch in chains.items()}
     transition = {s: ContractSet.from_chain(ch, cfg, cfg.transition_window_dte) for s, ch in chains.items()}
@@ -444,7 +476,11 @@ def main() -> None:
                    pivot_log=args.pivot_log, archive=archive, hold_levels=hold_levels)
 
     if not args.intraday:
-        print_summary(run_once(archive=True, hold_levels=False))
+        try:
+            result = run_once(archive=True, hold_levels=False)
+        except (requests.RequestException, ValueError) as err:
+            raise SystemExit(f"Run failed: {err}\nThe previous pack is unchanged.") from None
+        print_summary(result)
         return
     try:
         run_intraday(run_once, cfg)

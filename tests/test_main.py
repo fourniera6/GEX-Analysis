@@ -197,3 +197,61 @@ def test_run_intraday_archives_hourly_survives_errors_and_skips_missed_slots(mon
         ("14:15", True), ("14:45", False), ("15:15", True), ("15:45", False),
     ]
     assert [hold for _, _, hold in calls] == [False] + [True] * (len(calls) - 1)  # fresh first, then held
+
+
+class GappySource(FakeSource):
+    """CBOE's file without the Dec quotes for some symbols, for their first `bad` fetches (21 Oct: IWM)."""
+
+    def __init__(self, bad: dict[str, int]):
+        super().__init__()
+        self.bad, self.fetches = dict(bad), {}
+
+    def fetch_chain(self, underlying):
+        self.fetches[underlying] = self.fetches.get(underlying, 0) + 1
+        payload = json.loads(_synthetic_payload(underlying))
+        if self.fetches[underlying] <= self.bad.get(underlying, 0):
+            for o in payload["data"]["options"]:
+                if o["option"][-15:-9] == "261218":
+                    o["bid"] = o["ask"] = 0.0
+        return parse_payload(underlying, json.dumps(payload).encode())
+
+
+def _run_with(source, tmp_path, monkeypatch, name):
+    waits = []
+    monkeypatch.setattr(main, "sleep", waits.append)
+    result = run(source=source, out_dir=tmp_path / name, raw_dir=tmp_path / name / "raw",
+                 pivot_log=tmp_path / name / "pivot_log.csv", archive=True)
+    return result, waits
+
+
+def test_a_chain_missing_quotes_is_refetched(tmp_path, monkeypatch):
+    clean, _ = _run_with(FakeSource(), tmp_path, monkeypatch, "clean")
+    source = GappySource({"IWM": 1})
+    result, waits = _run_with(source, tmp_path, monkeypatch, "gappy")
+    assert waits == [60.0] and source.fetches["IWM"] == 2 and source.fetches["SPY"] == 1
+    assert result.pack_path.read_text().split("[PACK]")[1] == clean.pack_path.read_text().split("[PACK]")[1]
+
+
+def test_an_etf_that_stays_unpriceable_falls_back_to_its_quote(tmp_path, monkeypatch, capsys):
+    clean, _ = _run_with(FakeSource(), tmp_path, monkeypatch, "clean")
+    result, waits = _run_with(GappySource({"IWM": 99}), tmp_path, monkeypatch, "gappy")
+    assert len(waits) == 2
+    assert "WARNING: IWM" in capsys.readouterr().out
+    assert result.analyses["IWM"].spot == SPOTS["IWM"]  # the quoted price
+    for sym in ("SPX", "SPY", "NDX", "QQQ", "RUT"):
+        assert result.analyses[sym].zero_gamma == clean.analyses[sym].zero_gamma
+
+
+def test_an_index_that_stays_unpriceable_fails_cleanly(tmp_path, monkeypatch, capsys):
+    import pytest
+
+    monkeypatch.setattr(main, "sleep", lambda s: None)
+    monkeypatch.setattr(main, "CboeDelayedSource", lambda: GappySource({"SPX": 99}))
+    pack = tmp_path / "pack.txt"
+    monkeypatch.setattr("sys.argv", ["gex", "--pack-path", str(pack), "--out-dir", str(tmp_path / "o"),
+                                     "--raw-dir", str(tmp_path / "raw"), "--pivot-log", str(tmp_path / "log.csv")])
+    with pytest.raises(SystemExit) as exit_info:
+        main.main()
+    assert "Run failed: no two-sided quotes to imply a 2026-12-18 forward for SPX after 3 tries" in str(exit_info.value)
+    assert not pack.exists()
+    assert len(list((tmp_path / "raw").glob("SPX_*.json.gz"))) == 1  # the bad snapshot is kept for diagnosis
