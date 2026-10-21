@@ -1,0 +1,492 @@
+import argparse
+import csv
+import gzip
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from time import sleep
+
+import numpy as np
+import requests
+
+from .compare import drift_report, level_changes
+from .compute.basis import underlying_level
+from .compute.combine import combine_profiles
+from .compute.expected_move import expected_move_1d
+from .compute.peaks import find_peaks, half_width, sticky_peaks
+from .compute.per_strike import ContractSet, StrikeProfile
+from .compute.regime import classify_regime
+from .compute.walls import wall_confidence
+from .compute.zero_gamma import find_zero_gamma
+from .config import COMPLEXES, Complex, GexConfig
+from .data_sources.base import Chain, DataSource
+from .data_sources.cboe import ET, CboeDelayedSource, parse_payload
+from .output.analysis import GammaPeak, GexAnalysis, WallInfo
+from .output.pack import (
+    HistoryEntry,
+    PackSection,
+    build_pack,
+    build_refs,
+    format_pack_date,
+    pack_levels,
+    read_pack_file,
+    same_session,
+    write_pack_file,
+)
+from .timeline import write_timeline
+
+MARKET_OPEN = time(9, 30)
+MARKET_CLOSE = time(16, 0)
+PIVOT_LOG_FIELDS = [
+    "fetched", "session", "complex", "index_spot", "etf_spot", "ratio", "basis",
+    "tl_index_only", "tl_etf_only", "tl_combined", "dp_index_only", "dp_etf_only", "dp_combined",
+]
+
+
+def session_date(asof: datetime) -> date:
+    """The session a snapshot feeds: the same day during the session, the next weekday after the close.
+    Exchange holidays aren't modeled."""
+    offset = 1 if asof.time() >= MARKET_CLOSE else 0
+    return np.busday_offset(np.datetime64(asof.date(), "D"), offset, roll="forward").item()
+
+
+def build_analysis(
+    name: str,
+    spot: float,
+    asof: datetime,
+    profile: StrikeProfile,
+    structural_gex: Callable[[float], float],
+    transition_gex: Callable[[float], float],
+    expected_move: float,
+    cfg: GexConfig,
+    incumbent: list[float] | None = None,
+) -> GexAnalysis:
+    """`incumbent`: the previous pack's 12 slots for this symbol; walls and ranks then hold unless beaten
+    by more than `intraday_level_hysteresis`. TL and DP are always recomputed."""
+    zero_gamma = find_zero_gamma(structural_gex, spot, cfg.zg_search_range_pct, cfg.zg_grid_points)
+    transition = find_zero_gamma(transition_gex, spot, cfg.zg_search_range_pct, cfg.zg_grid_points)
+    dist = None if zero_gamma is None else spot - zero_gamma
+    dist_norm = None if dist is None else dist / expected_move
+    gex_at_spot = structural_gex(spot)
+    regime, confidence = classify_regime(gex_at_spot, dist_norm, cfg)
+
+    def ranked(values: np.ndarray, incumbents: list[float]) -> list[GammaPeak]:
+        magnitude = np.abs(values)
+        separation = cfg.peak_min_separation_pct * spot
+        idxs = find_peaks(profile.strikes, magnitude, cfg.peak_relative_threshold, separation)
+        if incumbents:
+            idxs = sticky_peaks(profile.strikes, magnitude, idxs, incumbents, cfg.intraday_level_hysteresis,
+                                cfg.peak_relative_threshold, separation)
+        top = max((magnitude[i] for i in idxs), default=1.0)
+        peaks = []
+        for i in idxs:
+            strike = float(profile.strikes[i])
+            peaks.append(GammaPeak(
+                strike=strike,
+                magnitude_signed=float(values[i]),
+                magnitude_normalized=float(magnitude[i] / top),
+                half_width_pts=half_width(profile.strikes, magnitude, i),
+                distance_to_spot_pts=strike - spot,
+                distance_to_spot_normalized=(strike - spot) / expected_move,
+                role="Resistance" if strike > spot else "Support",
+            ))
+        return peaks
+
+    def wall(peaks: list[GammaPeak]) -> WallInfo | None:
+        if not peaks:
+            return None
+        magnitudes = [abs(p.magnitude_signed) for p in peaks]
+        return WallInfo(peaks[0], wall_confidence(magnitudes, cfg.wall_dominance_threshold))
+
+    def held(*strikes: float) -> list[float]:
+        return list(dict.fromkeys(k for k in strikes if k)) if incumbent else []
+
+    slots = incumbent or [0.0] * 12
+    cw, pw, gd, c = slots[0], slots[1], slots[3:7], slots[7:11]
+    net = profile.net
+    positive_net = ranked(np.maximum(net, 0), held(cw, *(c if cfg.resistance_rank_source == "net" else [])))
+    negative_net = ranked(np.minimum(net, 0), held(pw, *(gd if cfg.support_rank_source == "net" else [])))
+    support = ranked(profile.put, held(*gd)) if cfg.support_rank_source == "put" else negative_net
+    resistance = ranked(profile.call, held(*c)) if cfg.resistance_rank_source == "call" else positive_net
+    scale = float(np.abs(net).max()) or 1.0
+    return GexAnalysis(
+        timestamp=asof.isoformat(),
+        underlying=name,
+        spot=spot,
+        expected_move_1d=expected_move,
+        total_gex_per_pct=gex_at_spot,
+        zero_gamma=zero_gamma,
+        transition_level=transition,
+        distance_to_zg_pts=dist,
+        distance_to_zg_normalized=dist_norm,
+        regime=regime.value,
+        regime_confidence=confidence,
+        call_wall=wall(positive_net),
+        put_wall=wall(negative_net),
+        support_peaks=support,
+        resistance_peaks=resistance,
+        gamma_profile={f"{k:g}": round(float(v) / scale, 4) for k, v in zip(profile.strikes, net)},
+    )
+
+
+def _summed_gex(index_set: ContractSet, etf_set: ContractSet, ratio: float) -> Callable[[float], float]:
+    return lambda s: index_set.total_gex(s) + etf_set.total_gex(s / ratio)
+
+
+def pivot_row(
+    fetched: datetime, session: date, c: Complex, chains: dict[str, Chain],
+    analyses: dict[str, GexAnalysis], combined: GexAnalysis, basis: float,
+) -> dict:
+    """Index-only, ETF-only (on the index scale) and combined TL/DP for one complex."""
+    ratio = chains[c.index].close / chains[c.etf].close
+    index, etf = analyses[c.index], analyses[c.etf]
+
+    def scaled(v: float | None) -> float | None:
+        return None if v is None else round(v * ratio, 2)
+
+    def rounded(v: float | None) -> float | None:
+        return None if v is None else round(v, 2)
+
+    return {
+        "fetched": f"{fetched:%Y-%m-%d %H:%M}", "session": session.isoformat(), "complex": c.index,
+        "index_spot": chains[c.index].spot, "etf_spot": chains[c.etf].spot, "ratio": round(ratio, 5), "basis": basis,
+        "tl_index_only": rounded(index.transition_level), "tl_etf_only": scaled(etf.transition_level),
+        "tl_combined": rounded(combined.transition_level),
+        "dp_index_only": rounded(index.zero_gamma), "dp_etf_only": scaled(etf.zero_gamma),
+        "dp_combined": rounded(combined.zero_gamma),
+    }
+
+
+def append_pivot_log(path: Path, rows: list[dict]) -> None:
+    is_new = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PIVOT_LOG_FIELDS)
+        if is_new:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def previous_open_interest(symbol: str, raw_dir: Path) -> tuple[str, float] | None:
+    """(fetch label, total OI) of the latest archived snapshot for symbol, if any."""
+    archives = sorted(raw_dir.glob(f"{symbol}_*.json.gz"))
+    if not archives:
+        return None
+    label = archives[-1].name[len(symbol) + 1: -len(".json.gz")]
+    chain = parse_payload(symbol, gzip.decompress(archives[-1].read_bytes()))
+    return label, float(chain.open_interest.sum())
+
+
+def describe_open_interest(
+    current: dict[str, float], previous: dict[str, tuple[str, float] | None], today: date
+) -> tuple[list[str], list[str]]:
+    """One line per symbol, and the symbols whose OI is unchanged since an earlier day's archive (likely stale)."""
+    lines, stale = [], []
+    for sym, total in current.items():
+        prev = previous.get(sym)
+        if prev is None:
+            lines.append(f"{sym:<4} OI {total:>12,.0f}  (no earlier archive)")
+            continue
+        label, prev_total = prev
+        change = "unchanged" if total == prev_total else f"{100 * (total / prev_total - 1):+.2f}%"
+        lines.append(f"{sym:<4} OI {total:>12,.0f}  ({change} vs archive {label})")
+        if total == prev_total and date.fromisoformat(label[:10]) < today:
+            stale.append(sym)
+    return lines, stale
+
+
+@dataclass
+class RunResult:
+    analyses: dict[str, GexAnalysis]
+    bases: dict[str, float]
+    session: date
+    pack_path: Path
+    pivot_rows: list[dict]
+    open_interest_lines: list[str]
+    stale_open_interest: list[str]
+    changes: list[str]
+    drift: list[str]
+    history_path: Path
+    timeline_path: Path | None = None
+
+
+def _price_chains(
+    chains: dict[str, Chain], source: DataSource, cfg: GexConfig, archive_path: Callable[[str], Path] | None,
+) -> tuple[dict[str, Chain], dict[str, float]]:
+    """Price every chain at the level implied by its own option quotes, and each index's futures basis.
+
+    Outside regular hours the quoted index level is stale while SPX options still trade, and ETF quotes move
+    pre-market while their options don't. CBOE's file sometimes lacks the quotes for a moment (IWM's Dec expiry on
+    21 Oct, SPX at the open on 7 Oct), so a failing symbol is re-fetched; an ETF then falls back to its quoted price.
+    """
+    indexes = {c.index for c in COMPLEXES}
+    priced, forwards = {}, {}
+    for sym, chain in chains.items():
+        for attempt in range(cfg.quote_retry_attempts + 1):
+            try:
+                spot, forwards[sym] = underlying_level(
+                    chain, cfg.risk_free_rate, cfg.futures_roll_days, cfg.basis_strike_range_pct)
+                break
+            except ValueError as err:
+                if attempt < cfg.quote_retry_attempts:
+                    print(f"{sym}: {err}; refetching in {cfg.quote_retry_seconds:g}s")
+                    sleep(cfg.quote_retry_seconds)
+                    chain = source.fetch_chain(sym)
+                    if archive_path:
+                        archive_path(sym).write_bytes(gzip.compress(chain.raw))
+                elif sym in indexes:
+                    raise ValueError(f"{err} after {attempt + 1} tries; CBOE's file is likely mid-update, "
+                                     "so try again in a few minutes") from err
+                else:
+                    print(f"WARNING: {sym}: {err}; its levels use the quoted price {chain.spot:.2f} instead of the "
+                          "price implied by its options.")
+                    spot = chain.spot
+        priced[sym] = replace(chain, spot=spot)
+    bases = {c.index: round(forwards[c.index] - priced[c.index].spot, 2) for c in COMPLEXES}
+    return priced, bases
+
+
+def run(
+    cfg: GexConfig | None = None,
+    source: DataSource | None = None,
+    out_dir: Path = Path("output"),
+    raw_dir: Path = Path("data/raw"),
+    pack_path: Path | None = None,
+    pivot_log: Path = Path("data/pivot_log.csv"),
+    archive: bool = True,
+    hold_levels: bool = False,
+    now: datetime | None = None,
+) -> RunResult:
+    """One full computation. Every pack written is also kept in <raw_dir>/../packs/<session>_<HHMM>.txt.
+    `hold_levels` applies intraday hysteresis to walls and ranks against this session's current pack."""
+    cfg = cfg or GexConfig()
+    source = source or CboeDelayedSource()
+    fetched = now or datetime.now(ET)
+    symbols = [s for c in COMPLEXES for s in (c.index, c.etf)]
+    chains = {s: source.fetch_chain(s) for s in symbols}
+    session = session_date(chains["SPX"].asof)
+
+    pack_path = pack_path or out_dir / "gex_pack.txt"
+    existing = read_pack_file(pack_path.read_text(encoding="utf-8")) if pack_path.exists() else None
+    today = PackSection(format_pack_date(session), {})
+    previous = existing.pack if existing and existing.pack and same_session(existing.pack, today) else None
+    incumbents = previous.blocks if hold_levels and previous else {}
+
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    oi_lines, stale_oi = describe_open_interest(
+        {s: float(ch.open_interest.sum()) for s, ch in chains.items()},
+        {s: previous_open_interest(s, raw_dir) for s in chains},
+        fetched.date(),
+    )
+    def archive_path(sym: str) -> Path:
+        return raw_dir / f"{sym}_{fetched:%Y-%m-%d_%H%M}.json.gz"
+
+    if archive:  # before pricing, so a snapshot that can't be priced is still on disk
+        for sym, chain in chains.items():
+            archive_path(sym).write_bytes(gzip.compress(chain.raw))
+
+    chains, bases = _price_chains(chains, source, cfg, archive_path if archive else None)
+
+    structural = {s: ContractSet.from_chain(ch, cfg, cfg.structural_window_dte) for s, ch in chains.items()}
+    transition = {s: ContractSet.from_chain(ch, cfg, cfg.transition_window_dte) for s, ch in chains.items()}
+    profiles = {s: structural[s].profile(ch.spot) for s, ch in chains.items()}
+    moves = {s: expected_move_1d(ch) for s, ch in chains.items()}
+    analyses = {
+        s: build_analysis(s, ch.spot, ch.asof, profiles[s], structural[s].total_gex, transition[s].total_gex,
+                          moves[s], cfg, incumbents.get(s))
+        for s, ch in chains.items()
+    }
+
+    # Research only: index + ETF gamma combined. Not used in the pack.
+    combined, pivot_rows = {}, []
+    for c in COMPLEXES:
+        index = chains[c.index]
+        ratio = index.close / chains[c.etf].close
+        name = f"{c.index}_{c.etf}"
+        combined[name] = build_analysis(
+            name, index.spot, index.asof,
+            combine_profiles(profiles[c.index], profiles[c.etf], ratio, cfg.combined_strike_step),
+            _summed_gex(structural[c.index], structural[c.etf], ratio),
+            _summed_gex(transition[c.index], transition[c.etf], ratio),
+            moves[c.index], cfg,
+        )
+        pivot_rows.append(pivot_row(fetched, session, c, chains, analyses, combined[name], bases[c.index]))
+    append_pivot_log(pivot_log, pivot_rows)
+
+    for a in [*analyses.values(), *combined.values()]:
+        (out_dir / f"analysis_{a.underlying}_{session}.json").write_text(a.to_json())
+
+    pack = build_pack({s: pack_levels(a) for s, a in analyses.items()}, bases, session)
+    # [PREMARKET] = the session's levels as of the open: set by any run before 09:30, then kept all session.
+    kept = existing.premarket if existing and existing.premarket and same_session(existing.premarket, pack) else None
+    premarket = pack if kept is None or fetched.time() < MARKET_OPEN else kept
+    # [HISTORY] = every pack written this session, so the chart and the timeline page can show the moves.
+    history = existing.history if existing and existing.pack and same_session(existing.pack, pack) else []
+    history = [*history, HistoryEntry(fetched.replace(tzinfo=None, second=0, microsecond=0), pack.blocks)]
+    write_pack_file(
+        pack_path,
+        build_refs({s: ch.close for s, ch in chains.items()}, bases),
+        pack,
+        [
+            f"Generated {fetched:%Y-%m-%d %H:%M} ET by gex-analysis from CBOE delayed quotes "
+            f"(SPX data as of {chains['SPX'].asof:%Y-%m-%d %H:%M} ET).",
+            "Futures blocks = index levels + basis implied by index options at the front futures expiry.",
+            "[REFS] ETF = its official close; futures = the index's official close + that basis, "
+            "so each pair is simultaneous even when run outside regular hours.",
+            "[PREMARKET] = this session's levels as of the open (service extension; ignored by the current indicator).",
+            "[HISTORY] = every pack written this session, one line each: write time (ET), then its blocks "
+            "(service extension; see docs/NT8-HISTORY-RENDERING.md).",
+        ],
+        premarket,
+        history,
+    )
+    history_path = raw_dir.parent / "packs" / f"{session}_{fetched:%H%M}.txt"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(pack_path.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        timeline_path = write_timeline(session, history_path.parent, pivot_log, out_dir)
+    except Exception as err:  # the page is a convenience: never let it cost a pack update
+        print(f"WARNING: timeline page not updated: {err!r}")
+        timeline_path = None
+    return RunResult(
+        {**analyses, **combined}, bases, session, pack_path, pivot_rows, oi_lines, stale_oi,
+        level_changes(previous, pack), drift_report(premarket, pack), history_path, timeline_path,
+    )
+
+
+def intraday_slots(now: datetime, start: time, end: time, every_minutes: int) -> list[datetime]:
+    """Scheduled run times still ahead of `now` today: start, start + every, ... up to end (ET)."""
+    slot = datetime.combine(now.date(), start, ET)
+    last = datetime.combine(now.date(), end, ET)
+    slots = []
+    while slot <= last:
+        if slot > now:
+            slots.append(slot)
+        slot += timedelta(minutes=every_minutes)
+    return slots
+
+
+def summarize(a: GexAnalysis) -> str:
+    def lvl(v: float | None) -> str:
+        return "-" if v is None else f"{v:g}" if v == int(v) else f"{v:.1f}"
+
+    def ranks(peaks: list[GammaPeak]) -> str:
+        return ", ".join(lvl(p.strike) for p in peaks[:4]) or "-"
+
+    return "\n".join([
+        f"{a.underlying:<8} spot {a.spot:.2f}  EM ±{a.expected_move_1d:.2f}  "
+        f"GEX ${a.total_gex_per_pct / 1e9:+.2f}B/1%  {a.regime} ({a.regime_confidence:.2f})",
+        f"         CW {lvl(a.call_wall and a.call_wall.peak.strike)}  PW {lvl(a.put_wall and a.put_wall.peak.strike)}  "
+        f"TL {lvl(a.transition_level)}  DP {lvl(a.zero_gamma)}",
+        f"         GD {ranks(a.support_peaks)}   C {ranks(a.resistance_peaks)}",
+    ])
+
+
+def print_changes(result: RunResult) -> None:
+    print("\nChanges since the previous pack")
+    for line in result.changes:
+        print(f"  {line}")
+    if result.drift:
+        print("\nMajor levels vs pre-market")
+        for line in result.drift:
+            print(f"  {line}")
+    print(f"\nPack for session {result.session} written to {result.pack_path} (copy: {result.history_path})")
+    if result.timeline_path:
+        print(f"Timeline: {result.timeline_path} (reload it in the browser after each update)")
+
+
+def print_summary(result: RunResult) -> None:
+    for c in COMPLEXES:
+        print(summarize(result.analyses[c.index]))
+        print(summarize(result.analyses[c.etf]))
+
+    def fmt(v: float | None) -> str:
+        return "-" if v is None else f"{v:.1f}"
+
+    print("\nPivots (research log), index scale: index-only / ETF-only / combined")
+    for row in result.pivot_rows:
+        print(f"  {row['complex']:<4} TL {fmt(row['tl_index_only'])} / {fmt(row['tl_etf_only'])} / {fmt(row['tl_combined'])}"
+              f"   DP {fmt(row['dp_index_only'])} / {fmt(row['dp_etf_only'])} / {fmt(row['dp_combined'])}")
+
+    print("\nOpen interest")
+    for line in result.open_interest_lines:
+        print(f"  {line}")
+    if result.stale_open_interest:
+        print(f"  WARNING: open interest unchanged since an earlier day's snapshot for "
+              f"{', '.join(result.stale_open_interest)}. CBOE may not have refreshed that data yet, so those levels "
+              "may be built on stale positioning. Consider re-running later.")
+
+    bases = "  ".join(f"{c.futures[0]}-{c.index} {result.bases[c.index]:+.2f}" for c in COMPLEXES)
+    print(f"\nBasis: {bases}")
+    print_changes(result)
+
+
+def run_intraday(run_once: Callable[..., RunResult], cfg: GexConfig) -> None:
+    """Run now (fresh levels), then at each remaining slot today with wall/rank hysteresis.
+    Raw snapshots are archived at most once per clock hour."""
+    last_archived_hour = None
+
+    def attempt(archive: bool, hold_levels: bool) -> RunResult | None:
+        try:
+            return run_once(archive=archive, hold_levels=hold_levels)
+        except (requests.RequestException, ValueError) as err:
+            print(f"\n{datetime.now(ET):%H:%M} ET update failed, keeping the previous pack: {err}")
+            return None
+
+    start = datetime.now(ET)
+    result = attempt(archive=True, hold_levels=False)
+    if result is not None:
+        print_summary(result)
+        last_archived_hour = start.replace(minute=0, second=0, microsecond=0)
+
+    for slot in intraday_slots(start, cfg.intraday_start, cfg.intraday_end, cfg.intraday_every_minutes):
+        wait = (slot - datetime.now(ET)).total_seconds()
+        if wait < -300:  # missed while the machine slept: skip rather than replay a burst
+            continue
+        print(f"\nNext update at {slot:%H:%M} ET (Ctrl-C to stop)")
+        sleep(max(wait, 0))
+        hour = slot.replace(minute=0)
+        archive = hour != last_archived_hour
+        result = attempt(archive, hold_levels=True)
+        if result is None:
+            continue
+        if archive:
+            last_archived_hour = hour
+        print(f"\n=== {datetime.now(ET):%H:%M} ET update ({'archived' if archive else 'not archived'}) ===")
+        print_changes(result)
+    print("\nIntraday updates finished for the day.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compute GEX levels and write gex_pack.txt.")
+    parser.add_argument("--pack-path", type=Path, help="where to write the pack (default: output/gex_pack.txt)")
+    parser.add_argument("--out-dir", type=Path, default=Path("output"))
+    parser.add_argument("--raw-dir", type=Path, default=Path("data/raw"))
+    parser.add_argument("--pivot-log", type=Path, default=Path("data/pivot_log.csv"))
+    parser.add_argument("--intraday", action="store_true",
+                        help="run now, then every 30 min from 09:45 to 15:45 ET, recomputing all levels")
+    args = parser.parse_args()
+
+    cfg = GexConfig()
+
+    def run_once(archive: bool, hold_levels: bool) -> RunResult:
+        return run(cfg=cfg, out_dir=args.out_dir, raw_dir=args.raw_dir, pack_path=args.pack_path,
+                   pivot_log=args.pivot_log, archive=archive, hold_levels=hold_levels)
+
+    if not args.intraday:
+        try:
+            result = run_once(archive=True, hold_levels=False)
+        except (requests.RequestException, ValueError) as err:
+            raise SystemExit(f"Run failed: {err}\nThe previous pack is unchanged.") from None
+        print_summary(result)
+        return
+    try:
+        run_intraday(run_once, cfg)
+    except KeyboardInterrupt:
+        print("\nStopped. The last pack written stays in place.")
+
+
+if __name__ == "__main__":
+    main()
